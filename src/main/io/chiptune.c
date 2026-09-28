@@ -18,8 +18,11 @@
  *
  * If not, see <http://www.gnu.org/licenses/>.
  *
- * Experimental timer-backed 3-channel + noise PSG player.
- * Approach A: hardware square-wave frequency, channels time-multiplexed.
+ * Experimental timer-backed PSG-style player for passive piezo.
+ *
+ * Monophonic hardware square wave: one frequency at a time.
+ * "Polyphony" is tracker-style rapid arpeggio (change ARR only at
+ * note boundaries; tone runs continuously during each dwell slot).
  */
 
 #include <stdbool.h>
@@ -54,6 +57,7 @@
 
 #define CHIPTUNE_CH_COUNT           3
 #define CHIPTUNE_PATTERN_LEN        16
+#define CHIPTUNE_ARP_MAX_NOTES      4
 
 #define CHIPTUNE_DRUM_NONE          0
 #define CHIPTUNE_DRUM_KICK          1
@@ -64,15 +68,15 @@
 #define CHIPTUNE_ARP_MIN            1
 #define CHIPTUNE_ARP_MAJ            2
 
-#define CHIPTUNE_MUX_DEFAULT_HZ     1000
-#define CHIPTUNE_MUX_MIN_HZ         100
-#define CHIPTUNE_MUX_MAX_HZ         8000
+#define CHIPTUNE_DWELL_DEFAULT_MS   8
+#define CHIPTUNE_DWELL_MIN_MS       1
+#define CHIPTUNE_DWELL_MAX_MS       100
 
-#define CHIPTUNE_TEST_NOTE_A4       440
-#define CHIPTUNE_TEST_NOTE_E5       659
-#define CHIPTUNE_TEST_NOTE_A5       880
-#define CHIPTUNE_TEST_PHASE_MS      2000
-#define CHIPTUNE_TEST_GAP_MS        300
+#define CHIPTUNE_TEST_A4            440
+#define CHIPTUNE_TEST_C5            523
+#define CHIPTUNE_TEST_E5            659
+#define CHIPTUNE_TEST_SECTION_MS    3000
+#define CHIPTUNE_TEST_GAP_MS        400
 #define CHIPTUNE_TEST_BEEP_MS       120
 #define CHIPTUNE_TEST_BEEP_GAP_MS   80
 
@@ -82,11 +86,9 @@ typedef enum {
 } chiptuneMode_e;
 
 typedef enum {
-    TEST_MARK_BEEPS = 0,  // N short beeps = mux-rate index (1..4)
+    TEST_MARK_BEEPS = 0,
     TEST_GAP,
-    TEST_ONE,             // A4 only
-    TEST_TWO,             // A4 + E5
-    TEST_THREE,           // A4 + E5 + A5
+    TEST_ARP,
     TEST_END_GAP,
 } chiptuneTestPhase_e;
 
@@ -101,38 +103,36 @@ typedef struct {
     uint8_t arp;
 } chiptuneRow_t;
 
-typedef struct {
-    volatile uint16_t freqHz;
-    volatile uint8_t volume;
-} chiptuneOsc_t;
-
-static chiptuneOsc_t oscillators[CHIPTUNE_CH_COUNT];
-static volatile uint16_t noiseFreqHz;
-static volatile uint8_t noiseVolume;
-static volatile uint16_t lfsr = 0xACE1u;
-
 static volatile bool playing;
 static chiptuneMode_e mode;
-static uint8_t muxIndex;
-static uint16_t muxHz = CHIPTUNE_MUX_DEFAULT_HZ;
+
+static uint16_t dwellMs = CHIPTUNE_DWELL_DEFAULT_MS;
+static uint16_t arpFreqs[CHIPTUNE_ARP_MAX_NOTES];
+static uint8_t arpVols[CHIPTUNE_ARP_MAX_NOTES];
+static uint8_t arpCount;
+static uint8_t arpIndex;
+static uint16_t currentToneHz;
+static timeUs_t nextArpStepUs;
 
 static uint8_t orderPos;
 static uint8_t row;
 static uint8_t tick;
-static uint8_t arpStep;
+static uint8_t arpChordStep;
 static uint8_t noiseDecay;
 static uint8_t currentPattern;
 static timeUs_t nextEngineTimeUs;
+static uint16_t drumFreqHz;
+static uint8_t drumVol;
+static uint16_t lfsr = 0xACE1u;
 
-// Test sequencer
 static chiptuneTestPhase_e testPhase;
-static uint8_t testRateIndex;
-static uint8_t testRateCount;
+static uint8_t testDwellIndex;
+static uint8_t testDwellCount;
 static uint8_t testMarkBeepLeft;
 static bool testMarkOn;
 static timeUs_t testPhaseEndUs;
-static uint16_t activeTestRates[4];
-static const uint16_t defaultTestMuxRates[] = { 500, 1000, 2000, 4000 };
+static uint16_t activeTestDwells[4];
+static const uint16_t defaultTestDwells[] = { 2, 4, 8, 12 };
 
 static const uint16_t noteFreqHz[CHIPTUNE_NOTE_COUNT] = {
     65, 69, 73, 78, 82, 87, 92, 98, 104, 110, 117, 123,
@@ -207,9 +207,7 @@ static const chiptuneRow_t pattern2[CHIPTUNE_PATTERN_LEN] = {
 };
 
 static const chiptuneRow_t * const patterns[] = {
-    pattern0,
-    pattern1,
-    pattern2,
+    pattern0, pattern1, pattern2,
 };
 
 static const uint8_t order[] = {
@@ -226,68 +224,86 @@ static uint16_t noteToFreq(uint8_t note)
     return noteFreqHz[note - CHIPTUNE_NOTE_MIN];
 }
 
-static void clearChannels(void)
+static void arpClear(void)
 {
-    for (int i = 0; i < CHIPTUNE_CH_COUNT; i++) {
-        oscillators[i].freqHz = 0;
-        oscillators[i].volume = 0;
-    }
-    noiseVolume = 0;
-    noiseFreqHz = 0;
+    arpCount = 0;
+    arpIndex = 0;
+    memset(arpFreqs, 0, sizeof(arpFreqs));
+    memset(arpVols, 0, sizeof(arpVols));
 }
 
-static void setChannel(uint8_t index, uint8_t note, uint8_t vol)
+static void arpAdd(uint16_t hz, uint8_t vol)
 {
-    if (index >= CHIPTUNE_CH_COUNT) {
+    if (!hz || !vol || arpCount >= CHIPTUNE_ARP_MAX_NOTES) {
         return;
     }
-    if (note == 0 || vol == 0) {
-        oscillators[index].freqHz = 0;
-        oscillators[index].volume = 0;
+    arpFreqs[arpCount] = hz;
+    arpVols[arpCount] = vol > 15 ? 15 : vol;
+    arpCount++;
+}
+
+static void applyTone(uint16_t hz, uint8_t vol)
+{
+    // Only touch the timer when the note changes — keep continuous square during dwell.
+    if (hz == 0) {
+        if (currentToneHz != 0) {
+            currentToneHz = 0;
+            beeperPwmSetTone(0, 0);
+        }
         return;
     }
-    oscillators[index].freqHz = noteToFreq(note);
-    oscillators[index].volume = vol > 15 ? 15 : vol;
-}
-
-static void setChannelHz(uint8_t index, uint16_t hz, uint8_t vol)
-{
-    if (index >= CHIPTUNE_CH_COUNT) {
+    if (hz == currentToneHz) {
         return;
     }
-    oscillators[index].freqHz = hz;
-    oscillators[index].volume = (hz && vol) ? (vol > 15 ? 15 : vol) : 0;
+    currentToneHz = hz;
+    beeperPwmSetTone(hz, vol);
 }
 
-static void applyMuxRate(uint16_t hz)
+static void arpSilence(void)
 {
-    muxHz = constrain(hz, CHIPTUNE_MUX_MIN_HZ, CHIPTUNE_MUX_MAX_HZ);
-    rescheduleTask(TASK_CHIPTUNE, TASK_PERIOD_HZ(muxHz));
+    currentToneHz = 0;
+    beeperPwmSetTone(0, 0);
 }
 
-static void enableMuxTask(bool on)
+static void enableArpTask(bool on)
 {
     setTaskEnabled(TASK_CHIPTUNE, on);
+}
+
+static void applyDwell(uint16_t ms)
+{
+    dwellMs = constrain(ms, CHIPTUNE_DWELL_MIN_MS, CHIPTUNE_DWELL_MAX_MS);
+    // Poll a bit faster than the shortest dwell so boundaries stay tight.
+    const uint16_t pollHz = (uint16_t)constrain(1000 / dwellMs * 2, 100, 2000);
+    rescheduleTask(TASK_CHIPTUNE, TASK_PERIOD_HZ(pollHz));
+}
+
+static void setTestChordArp(void)
+{
+    arpClear();
+    arpAdd(CHIPTUNE_TEST_A4, 15);
+    arpAdd(CHIPTUNE_TEST_C5, 15);
+    arpAdd(CHIPTUNE_TEST_E5, 15);
+    arpIndex = 0;
+    nextArpStepUs = 0;
 }
 
 static void triggerDrum(uint8_t drum)
 {
     switch (drum) {
     case CHIPTUNE_DRUM_KICK:
-        noiseFreqHz = 180;
-        noiseVolume = 14;
-        noiseDecay = 4;
-        oscillators[0].freqHz = noteToFreq(36);
-        oscillators[0].volume = 12;
-        break;
-    case CHIPTUNE_DRUM_SNARE:
-        noiseFreqHz = 1200;
-        noiseVolume = 13;
+        drumFreqHz = 180;
+        drumVol = 14;
         noiseDecay = 3;
         break;
+    case CHIPTUNE_DRUM_SNARE:
+        drumFreqHz = 1400;
+        drumVol = 12;
+        noiseDecay = 2;
+        break;
     case CHIPTUNE_DRUM_HAT:
-        noiseFreqHz = 4000;
-        noiseVolume = 8;
+        drumFreqHz = 3200;
+        drumVol = 8;
         noiseDecay = 1;
         break;
     default:
@@ -295,23 +311,44 @@ static void triggerDrum(uint8_t drum)
     }
 }
 
-static void applyRow(const chiptuneRow_t *r)
+static void rebuildDemoArp(const chiptuneRow_t *r)
 {
-    setChannel(0, r->ch[0].note, r->ch[0].vol);
-    setChannel(1, r->ch[1].note, r->ch[1].vol);
+    arpClear();
 
-    if (r->arp == CHIPTUNE_ARP_OFF) {
-        setChannel(2, r->ch[2].note, r->ch[2].vol);
-    } else {
+    // Monophonic voice priority queue for this row: lead, bass, chord tones.
+    if (r->ch[1].note && r->ch[1].vol) {
+        arpAdd(noteToFreq(r->ch[1].note), r->ch[1].vol);
+    }
+    if (r->ch[0].note && r->ch[0].vol) {
+        arpAdd(noteToFreq(r->ch[0].note), r->ch[0].vol);
+    }
+
+    if (r->arp != CHIPTUNE_ARP_OFF && r->ch[2].note && r->ch[2].vol) {
         const int8_t *intervals = (r->arp == CHIPTUNE_ARP_MAJ) ? arpMajor : arpMinor;
         const uint8_t root = r->ch[2].note;
-        const uint8_t note = root ? (uint8_t)(root + intervals[arpStep % 3]) : 0;
-        setChannel(2, note, r->ch[2].vol);
+        for (int i = 0; i < 3 && arpCount < CHIPTUNE_ARP_MAX_NOTES; i++) {
+            const uint8_t n = (uint8_t)(root + intervals[(arpChordStep + i) % 3]);
+            arpAdd(noteToFreq(n), r->ch[2].vol);
+        }
+    } else if (r->ch[2].note && r->ch[2].vol) {
+        arpAdd(noteToFreq(r->ch[2].note), r->ch[2].vol);
     }
 
-    if (r->drum != CHIPTUNE_DRUM_NONE) {
-        triggerDrum(r->drum);
+    if (drumVol && drumFreqHz) {
+        // Insert drum hit as a short dedicated step at the front for this rebuild.
+        if (arpCount < CHIPTUNE_ARP_MAX_NOTES) {
+            // Shift up to make room
+            for (int i = arpCount; i > 0; i--) {
+                arpFreqs[i] = arpFreqs[i - 1];
+                arpVols[i] = arpVols[i - 1];
+            }
+            arpFreqs[0] = drumFreqHz;
+            arpVols[0] = drumVol;
+            arpCount++;
+        }
     }
+
+    arpIndex = 0;
 }
 
 static void engineTickDemo(void)
@@ -320,31 +357,27 @@ static void engineTickDemo(void)
     const chiptuneRow_t *r = &patterns[currentPattern][row];
 
     if (tick == 0) {
-        arpStep = 0;
-        applyRow(r);
-    } else if (r->arp != CHIPTUNE_ARP_OFF) {
-        arpStep++;
-        const int8_t *intervals = (r->arp == CHIPTUNE_ARP_MAJ) ? arpMajor : arpMinor;
-        const uint8_t root = r->ch[2].note;
-        const uint8_t note = root ? (uint8_t)(root + intervals[arpStep % 3]) : 0;
-        setChannel(2, note, r->ch[2].vol);
-    }
-
-    if (noiseDecay && noiseVolume) {
-        noiseDecay--;
-        if (noiseVolume > 2) {
-            noiseVolume -= 2;
-        } else {
-            noiseVolume = 0;
-            noiseFreqHz = 0;
+        arpChordStep = 0;
+        if (r->drum != CHIPTUNE_DRUM_NONE) {
+            triggerDrum(r->drum);
         }
-        if (noiseVolume && noiseFreqHz >= 800) {
-            const uint16_t bit = ((lfsr >> 0) ^ (lfsr >> 1)) & 1u;
-            lfsr = (lfsr >> 1) | (bit << 15);
-            if (lfsr == 0) {
-                lfsr = 0xACE1u;
+        rebuildDemoArp(r);
+    } else {
+        arpChordStep++;
+        rebuildDemoArp(r);
+        if (noiseDecay) {
+            noiseDecay--;
+            if (noiseDecay == 0) {
+                drumVol = 0;
+                drumFreqHz = 0;
+            } else if (drumFreqHz >= 800) {
+                const uint16_t bit = ((lfsr >> 0) ^ (lfsr >> 1)) & 1u;
+                lfsr = (lfsr >> 1) | (bit << 15);
+                if (lfsr == 0) {
+                    lfsr = 0xACE1u;
+                }
+                drumFreqHz = (uint16_t)(800 + (lfsr & 0x7FF));
             }
-            noiseFreqHz = (uint16_t)(800 + (lfsr & 0x7FF));
         }
     }
 
@@ -363,32 +396,21 @@ static void engineTickDemo(void)
 
     debug[0] = currentPattern;
     debug[1] = row;
-    debug[2] = oscillators[1].freqHz;
-    debug[3] = muxHz;
+    debug[2] = currentToneHz;
+    debug[3] = dwellMs;
 }
 
-static void applyTestVoices(uint8_t voiceCount)
+static void beginTestDwell(timeUs_t nowUs)
 {
-    clearChannels();
-    if (voiceCount >= 1) {
-        setChannelHz(0, CHIPTUNE_TEST_NOTE_A4, 15);
-    }
-    if (voiceCount >= 2) {
-        setChannelHz(1, CHIPTUNE_TEST_NOTE_E5, 15);
-    }
-    if (voiceCount >= 3) {
-        setChannelHz(2, CHIPTUNE_TEST_NOTE_A5, 15);
-    }
-}
-
-static void beginTestRate(timeUs_t nowUs)
-{
-    applyMuxRate(activeTestRates[testRateIndex]);
+    applyDwell(activeTestDwells[testDwellIndex]);
     testPhase = TEST_MARK_BEEPS;
-    testMarkBeepLeft = (uint8_t)(testRateIndex + 1);
+    testMarkBeepLeft = (uint8_t)(testDwellIndex + 1);
     testMarkOn = true;
-    clearChannels();
-    setChannelHz(0, 880, 15);
+    arpClear();
+    arpAdd(880, 15);
+    arpIndex = 0;
+    nextArpStepUs = 0;
+    applyTone(880, 15);
     testPhaseEndUs = nowUs + (CHIPTUNE_TEST_BEEP_MS * 1000);
 }
 
@@ -396,9 +418,9 @@ static void engineTickTest(timeUs_t nowUs)
 {
     if (cmpTimeUs(nowUs, testPhaseEndUs) < 0) {
         debug[0] = testPhase;
-        debug[1] = testRateIndex;
-        debug[2] = activeTestRates[testRateIndex];
-        debug[3] = muxHz;
+        debug[1] = testDwellIndex;
+        debug[2] = activeTestDwells[testDwellIndex];
+        debug[3] = currentToneHz;
         return;
     }
 
@@ -406,7 +428,8 @@ static void engineTickTest(timeUs_t nowUs)
     case TEST_MARK_BEEPS:
         if (testMarkOn) {
             testMarkOn = false;
-            clearChannels();
+            arpSilence();
+            arpClear();
             testPhaseEndUs = nowUs + (CHIPTUNE_TEST_BEEP_GAP_MS * 1000);
             if (testMarkBeepLeft > 1) {
                 testMarkBeepLeft--;
@@ -415,100 +438,71 @@ static void engineTickTest(timeUs_t nowUs)
             }
         } else {
             testMarkOn = true;
-            setChannelHz(0, 880, 15);
+            arpClear();
+            arpAdd(880, 15);
+            applyTone(880, 15);
             testPhaseEndUs = nowUs + (CHIPTUNE_TEST_BEEP_MS * 1000);
         }
         break;
 
     case TEST_GAP:
-        clearChannels();
-        testPhase = TEST_ONE;
-        applyTestVoices(1);
-        testPhaseEndUs = nowUs + (CHIPTUNE_TEST_PHASE_MS * 1000);
+        arpSilence();
+        testPhase = TEST_ARP;
+        setTestChordArp();
+        applyTone(arpFreqs[0], arpVols[0]);
+        arpIndex = 0;
+        nextArpStepUs = nowUs + (dwellMs * 1000);
+        testPhaseEndUs = nowUs + (CHIPTUNE_TEST_SECTION_MS * 1000);
         break;
 
-    case TEST_ONE:
-        testPhase = TEST_TWO;
-        applyTestVoices(2);
-        testPhaseEndUs = nowUs + (CHIPTUNE_TEST_PHASE_MS * 1000);
-        break;
-
-    case TEST_TWO:
-        testPhase = TEST_THREE;
-        applyTestVoices(3);
-        testPhaseEndUs = nowUs + (CHIPTUNE_TEST_PHASE_MS * 1000);
-        break;
-
-    case TEST_THREE:
-        clearChannels();
+    case TEST_ARP:
+        arpSilence();
+        arpClear();
         testPhase = TEST_END_GAP;
         testPhaseEndUs = nowUs + (CHIPTUNE_TEST_GAP_MS * 1000);
         break;
 
     case TEST_END_GAP:
-        testRateIndex++;
-        if (testRateIndex >= testRateCount) {
+        testDwellIndex++;
+        if (testDwellIndex >= testDwellCount) {
             chiptuneStop();
             return;
         }
-        beginTestRate(nowUs);
+        beginTestDwell(nowUs);
         break;
     }
 
     debug[0] = testPhase;
-    debug[1] = testRateIndex;
-    debug[2] = activeTestRates[testRateIndex];
-    debug[3] = muxHz;
+    debug[1] = testDwellIndex;
+    debug[2] = activeTestDwells[testDwellIndex];
+    debug[3] = currentToneHz;
 }
 
-static void muxOutput(void)
-{
-    for (int attempt = 0; attempt < 4; attempt++) {
-        const uint8_t slot = muxIndex++ & 3u;
-
-        if (slot == 3) {
-            if (noiseVolume && noiseFreqHz) {
-                beeperPwmSetTone(noiseFreqHz, noiseVolume);
-                return;
-            }
-            continue;
-        }
-
-        if (oscillators[slot].volume && oscillators[slot].freqHz) {
-            beeperPwmSetTone(oscillators[slot].freqHz, oscillators[slot].volume);
-            return;
-        }
-    }
-
-    beeperPwmSetTone(0, 0);
-}
-
-static bool chiptuneBegin(chiptuneMode_e startMode, uint16_t startMuxHz)
+static bool chiptuneBegin(chiptuneMode_e startMode, uint16_t dwellOrZero)
 {
     if (playing) {
         chiptuneStop();
     }
 
-    if (ARMING_FLAG(ARMED)) {
-        return false;
-    }
-
-    if (!beeperPwmIsReady()) {
+    if (ARMING_FLAG(ARMED) || !beeperPwmIsReady()) {
         return false;
     }
 
     beeperSilence();
 
-    clearChannels();
-    lfsr = 0xACE1u;
-    muxIndex = 0;
+    arpClear();
+    currentToneHz = 0;
     orderPos = 0;
     row = 0;
     tick = 0;
-    arpStep = 0;
+    arpChordStep = 0;
     noiseDecay = 0;
+    drumFreqHz = 0;
+    drumVol = 0;
+    lfsr = 0xACE1u;
     currentPattern = order[0];
     nextEngineTimeUs = 0;
+    nextArpStepUs = 0;
     mode = startMode;
 
     if (!beeperPwmAudioStart(0, 0, NULL)) {
@@ -516,23 +510,23 @@ static bool chiptuneBegin(chiptuneMode_e startMode, uint16_t startMuxHz)
     }
 
     if (startMode == MODE_TEST) {
-        if (startMuxHz == 0) {
-            testRateCount = ARRAYLEN(defaultTestMuxRates);
-            for (uint8_t i = 0; i < testRateCount; i++) {
-                activeTestRates[i] = defaultTestMuxRates[i];
+        if (dwellOrZero == 0) {
+            testDwellCount = ARRAYLEN(defaultTestDwells);
+            for (uint8_t i = 0; i < testDwellCount; i++) {
+                activeTestDwells[i] = defaultTestDwells[i];
             }
         } else {
-            testRateCount = 1;
-            activeTestRates[0] = constrain(startMuxHz, CHIPTUNE_MUX_MIN_HZ, CHIPTUNE_MUX_MAX_HZ);
+            testDwellCount = 1;
+            activeTestDwells[0] = constrain(dwellOrZero, CHIPTUNE_DWELL_MIN_MS, CHIPTUNE_DWELL_MAX_MS);
         }
-        testRateIndex = 0;
-        beginTestRate(micros());
+        testDwellIndex = 0;
+        beginTestDwell(micros());
     } else {
-        applyMuxRate(startMuxHz ? startMuxHz : muxHz);
+        applyDwell(dwellOrZero ? dwellOrZero : dwellMs);
     }
 
     playing = true;
-    enableMuxTask(true);
+    enableArpTask(true);
     return true;
 }
 
@@ -541,17 +535,17 @@ bool chiptuneIsPlaying(void)
     return playing;
 }
 
-uint16_t chiptuneGetMuxHz(void)
+uint16_t chiptuneGetDwellMs(void)
 {
-    return muxHz;
+    return dwellMs;
 }
 
-bool chiptuneSetMuxHz(uint16_t hz)
+bool chiptuneSetDwellMs(uint16_t ms)
 {
-    if (hz < CHIPTUNE_MUX_MIN_HZ || hz > CHIPTUNE_MUX_MAX_HZ) {
+    if (ms < CHIPTUNE_DWELL_MIN_MS || ms > CHIPTUNE_DWELL_MAX_MS) {
         return false;
     }
-    applyMuxRate(hz);
+    applyDwell(ms);
     return true;
 }
 
@@ -562,20 +556,20 @@ void chiptuneStop(void)
     }
 
     playing = false;
-    enableMuxTask(false);
-    clearChannels();
-    beeperPwmSetTone(0, 0);
+    enableArpTask(false);
+    arpClear();
+    arpSilence();
     beeperPwmAudioStop();
 }
 
 bool chiptuneStart(void)
 {
-    return chiptuneBegin(MODE_DEMO, muxHz);
+    return chiptuneBegin(MODE_DEMO, dwellMs);
 }
 
-bool chiptuneStartTest(uint16_t requestedMuxHz)
+bool chiptuneStartTest(uint16_t dwellMsOrZero)
 {
-    return chiptuneBegin(MODE_TEST, requestedMuxHz);
+    return chiptuneBegin(MODE_TEST, dwellMsOrZero);
 }
 
 void chiptuneUpdate(timeUs_t currentTimeUs)
@@ -604,15 +598,41 @@ void chiptuneUpdate(timeUs_t currentTimeUs)
     }
 }
 
-void chiptuneMuxUpdate(timeUs_t currentTimeUs)
+void chiptuneArpUpdate(timeUs_t currentTimeUs)
 {
-    UNUSED(currentTimeUs);
-
     if (!playing) {
         return;
     }
 
-    muxOutput();
+    if (arpCount == 0) {
+        applyTone(0, 0);
+        return;
+    }
+
+    if (nextArpStepUs == 0) {
+        applyTone(arpFreqs[arpIndex], arpVols[arpIndex]);
+        nextArpStepUs = currentTimeUs + (dwellMs * 1000);
+        return;
+    }
+
+    if (cmpTimeUs(currentTimeUs, nextArpStepUs) < 0) {
+        return;
+    }
+
+    // Dwell elapsed: step to the next note and retune ARR once.
+    arpIndex++;
+    if (arpIndex >= arpCount) {
+        arpIndex = 0;
+    }
+    applyTone(arpFreqs[arpIndex], arpVols[arpIndex]);
+
+    nextArpStepUs += (dwellMs * 1000);
+    if (cmpTimeUs(currentTimeUs, nextArpStepUs) > 20000) {
+        nextArpStepUs = currentTimeUs + (dwellMs * 1000);
+    }
+
+    debug[2] = currentToneHz;
+    debug[3] = dwellMs;
 }
 
 #endif // USE_CHIPTUNE

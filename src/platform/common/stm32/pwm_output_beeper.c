@@ -124,7 +124,6 @@ void beeperPwmSetTone(uint16_t freqHz, uint8_t volume015)
         return;
     }
 
-    // Keep within 16-bit ARR at 1 MHz timebase
     freqHz = constrain(freqHz, 16, 10000);
     const uint16_t period = (uint16_t)(PWM_TIMER_1MHZ / freqHz);
     uint16_t duty = (uint16_t)(((uint32_t)(period / 2) * volume015) / 15);
@@ -132,7 +131,7 @@ void beeperPwmSetTone(uint16_t freqHz, uint8_t volume015)
         duty = 1;
     }
 
-    // Lightweight update — avoid full pwmOutputConfig on every mux slot
+    // Retune at note boundary only (caller must not spam same frequency).
     timerSetPeriod(beeperTimer, period - 1);
     timerSetCounter(beeperTimer, 0);
     *beeperPwm.channel.ccr = duty;

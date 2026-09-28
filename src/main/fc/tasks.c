@@ -414,8 +414,8 @@ task_attribute_t task_attributes[TASK_COUNT] = {
 #endif
 
 #ifdef USE_CHIPTUNE
-    // Mux rate is rescheduled at runtime (500..4000 Hz) while a test/demo plays.
-    [TASK_CHIPTUNE] = DEFINE_TASK("CHIPTUNE", NULL, NULL, chiptuneMuxUpdate, TASK_PERIOD_HZ(1000), TASK_PRIORITY_LOW),
+    // Arpeggio stepper; period rescheduled from dwell time (poll ~2x dwell rate).
+    [TASK_CHIPTUNE] = DEFINE_TASK("CHIPTUNE", NULL, NULL, chiptuneArpUpdate, TASK_PERIOD_HZ(500), TASK_PRIORITY_LOW),
 #endif
 
 #ifdef USE_GPS

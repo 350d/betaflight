@@ -29,15 +29,16 @@
 #ifdef USE_CHIPTUNE
 
 bool chiptuneStart(void);
-bool chiptuneStartTest(uint16_t muxHz); // 0 = sweep 500/1000/2000/4000
+// dwellMs: 0 = sweep 2/4/8/12 ms; else fixed dwell for A4-C5-E5 arpeggio test
+bool chiptuneStartTest(uint16_t dwellMs);
 void chiptuneStop(void);
 bool chiptuneIsPlaying(void);
-bool chiptuneSetMuxHz(uint16_t muxHz);
-uint16_t chiptuneGetMuxHz(void);
+bool chiptuneSetDwellMs(uint16_t dwellMs);
+uint16_t chiptuneGetDwellMs(void);
 
-// Tracker / test sequencer (from TASK_BEEPER ~100 Hz)
+// Tracker / test sequencer (TASK_BEEPER ~100 Hz)
 void chiptuneUpdate(timeUs_t currentTimeUs);
-// Channel mux (from TASK_CHIPTUNE at mux rate)
-void chiptuneMuxUpdate(timeUs_t currentTimeUs);
+// Monophonic arpeggio stepper (TASK_CHIPTUNE, fast)
+void chiptuneArpUpdate(timeUs_t currentTimeUs);
 
 #endif // USE_CHIPTUNE
