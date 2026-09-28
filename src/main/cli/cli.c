@@ -114,6 +114,9 @@ bool cliMode = false;
 
 #include "io/asyncfatfs/asyncfatfs.h"
 #include "io/beeper.h"
+#ifdef USE_CHIPTUNE
+#include "io/chiptune.h"
+#endif
 #include "io/dronecan/dronecan.h"
 #include "io/dronecan/dronecan_msg.h"
 #include "io/dronecan/dronecan_nodes.h"
@@ -4952,6 +4955,35 @@ RAM_CODE static void cliPlaySound(const char *cmdName, char *cmdline)
 }
 #endif
 
+#ifdef USE_CHIPTUNE
+RAM_CODE static void cliChiptune(const char *cmdName, char *cmdline)
+{
+    UNUSED(cmdName);
+
+    if (isEmpty(cmdline)) {
+        cliPrintLinef("chiptune: %s", chiptuneIsPlaying() ? "playing" : "stopped");
+        return;
+    }
+
+    if (strcasecmp(cmdline, "play") == 0 || strcasecmp(cmdline, "start") == 0) {
+        if (chiptuneStart()) {
+            cliPrintLine("chiptune: play");
+        } else {
+            cliPrintLine("chiptune: failed (need timer-backed beeper, craft disarmed)");
+        }
+        return;
+    }
+
+    if (strcasecmp(cmdline, "stop") == 0) {
+        chiptuneStop();
+        cliPrintLine("chiptune: stop");
+        return;
+    }
+
+    cliPrintLine("usage: chiptune [play|stop]");
+}
+#endif
+
 RAM_CODE static void cliProfile(const char *cmdName, char *cmdline)
 {
     if (isEmpty(cmdline)) {
@@ -8637,6 +8669,9 @@ const clicmd_t cmdTable[] = {
 #endif
 #if defined(USE_BOARD_INFO)
     CLI_COMMAND_DEF("board_name", "get / set the name of the board model", "[board name]", cliBoardName),
+#endif
+#ifdef USE_CHIPTUNE
+    CLI_COMMAND_DEF("chiptune", "experimental beeper PSG demo player", "[play|stop]", cliChiptune),
 #endif
 #ifdef USE_LED_STRIP_STATUS_MODE
         CLI_COMMAND_DEF("color", "configure colors", NULL, cliColor),

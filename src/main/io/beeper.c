@@ -64,6 +64,10 @@
 
 #include "beeper.h"
 
+#ifdef USE_CHIPTUNE
+#include "io/chiptune.h"
+#endif
+
 #ifdef BEEPER_INVERTED
 #define IS_OPEN_DRAIN   false
 #define IS_INVERTED     true
@@ -269,6 +273,11 @@ static const beeperTableEntry_t *beeperFind(beeperMode_e mode)
  */
 void beeper(beeperMode_e mode)
 {
+#ifdef USE_CHIPTUNE
+    if (chiptuneIsPlaying()) {
+        return;
+    }
+#endif
     if (mode == BEEPER_SILENCE
         || beeperUsbSuppressed()
         || IS_RC_MODE_ACTIVE(BOXBEEPERMUTE) ) {
@@ -424,6 +433,13 @@ static enum beeperState_e beeperSequenceAdvance(timeUs_t currentTimeUs)
  */
 void beeperUpdate(timeUs_t currentTimeUs)
 {
+#ifdef USE_CHIPTUNE
+    // Tracker engine at ~50 Hz; audio samples run in beeper timer overflow ISR.
+    chiptuneUpdate(currentTimeUs);
+    if (chiptuneIsPlaying()) {
+        return;
+    }
+#endif
     // If beeper option from AUX switch has been selected
     if (IS_RC_MODE_ACTIVE(BOXBEEPERON)) {
         beeper(BEEPER_RX_SET);

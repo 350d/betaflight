@@ -41,3 +41,12 @@ void beeperInit(const struct beeperDevConfig_s *beeperDevConfig);
 void pwmWriteBeeper(bool on);
 void pwmToggleBeeper(void);
 void beeperPwmInit(const ioTag_t tag, uint16_t frequency);
+
+#ifdef USE_CHIPTUNE
+struct timerOvrHandlerRec_s;
+bool beeperPwmIsReady(void);
+bool beeperPwmAudioStart(uint32_t hz, uint16_t period, struct timerOvrHandlerRec_s *overflowCb);
+void beeperPwmAudioStop(void);
+void beeperPwmSetDuty(uint16_t duty);
+uint16_t beeperPwmGetPeriod(void);
+#endif

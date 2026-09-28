@@ -47,6 +47,35 @@ static uint8_t beeperLedcChannel = 0;
 static bool beeperActive = false;
 static uint32_t beeperDuty = 0;
 
+#ifdef USE_CHIPTUNE
+bool beeperPwmIsReady(void)
+{
+    return false;
+}
+
+bool beeperPwmAudioStart(uint32_t hz, uint16_t period, struct timerOvrHandlerRec_s *overflowCb)
+{
+    UNUSED(hz);
+    UNUSED(period);
+    UNUSED(overflowCb);
+    return false;
+}
+
+void beeperPwmAudioStop(void)
+{
+}
+
+void beeperPwmSetDuty(uint16_t duty)
+{
+    UNUSED(duty);
+}
+
+uint16_t beeperPwmGetPeriod(void)
+{
+    return 0;
+}
+#endif
+
 void beeperPwmInit(const ioTag_t tag, uint16_t frequency)
 {
     if (!tag || frequency == 0) return;

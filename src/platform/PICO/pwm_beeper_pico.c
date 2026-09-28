@@ -25,8 +25,13 @@
 
 #if defined(USE_BEEPER) && defined(USE_PWM_OUTPUT)
 
+#include "common/utils.h"
+
 #include "drivers/io.h"
 #include "drivers/io_impl.h"
+#include "drivers/sound_beeper.h"
+#include "drivers/timer.h"
+
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 
@@ -49,6 +54,35 @@ void pwmToggleBeeper(void)
     beeperEnabled = !beeperEnabled;
     pwmWriteBeeper(beeperEnabled);
 }
+
+#ifdef USE_CHIPTUNE
+bool beeperPwmIsReady(void)
+{
+    return false;
+}
+
+bool beeperPwmAudioStart(uint32_t hz, uint16_t period, timerOvrHandlerRec_t *overflowCb)
+{
+    UNUSED(hz);
+    UNUSED(period);
+    UNUSED(overflowCb);
+    return false;
+}
+
+void beeperPwmAudioStop(void)
+{
+}
+
+void beeperPwmSetDuty(uint16_t duty)
+{
+    UNUSED(duty);
+}
+
+uint16_t beeperPwmGetPeriod(void)
+{
+    return 0;
+}
+#endif
 
 void beeperPwmInit(const ioTag_t tag, uint16_t frequency)
 {
