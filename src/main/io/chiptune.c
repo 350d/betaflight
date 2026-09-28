@@ -68,7 +68,7 @@
 #define CHIPTUNE_ARP_MIN            1
 #define CHIPTUNE_ARP_MAJ            2
 
-#define CHIPTUNE_DWELL_DEFAULT_MS   8
+#define CHIPTUNE_DWELL_DEFAULT_MS   20
 #define CHIPTUNE_DWELL_MIN_MS       1
 #define CHIPTUNE_DWELL_MAX_MS       100
 
@@ -132,7 +132,7 @@ static uint8_t testMarkBeepLeft;
 static bool testMarkOn;
 static timeUs_t testPhaseEndUs;
 static uint16_t activeTestDwells[4];
-static const uint16_t defaultTestDwells[] = { 2, 4, 8, 12 };
+static const uint16_t defaultTestDwells[] = { 12, 16, 20, 24 };
 
 static const uint16_t noteFreqHz[CHIPTUNE_NOTE_COUNT] = {
     65, 69, 73, 78, 82, 87, 92, 98, 104, 110, 117, 123,
