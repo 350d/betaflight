@@ -48,5 +48,6 @@ bool beeperPwmIsReady(void);
 bool beeperPwmAudioStart(uint32_t hz, uint16_t period, struct timerOvrHandlerRec_s *overflowCb);
 void beeperPwmAudioStop(void);
 void beeperPwmSetDuty(uint16_t duty);
+void beeperPwmSetTone(uint16_t freqHz, uint8_t volume015);
 uint16_t beeperPwmGetPeriod(void);
 #endif

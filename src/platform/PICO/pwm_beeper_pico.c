@@ -78,6 +78,12 @@ void beeperPwmSetDuty(uint16_t duty)
     UNUSED(duty);
 }
 
+void beeperPwmSetTone(uint16_t freqHz, uint8_t volume015)
+{
+    UNUSED(freqHz);
+    UNUSED(volume015);
+}
+
 uint16_t beeperPwmGetPeriod(void)
 {
     return 0;

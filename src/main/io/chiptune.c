@@ -19,7 +19,9 @@
  * If not, see <http://www.gnu.org/licenses/>.
  *
  * Experimental timer-backed 3-channel + noise PSG player.
- * Output architecture B: mixed PWM samples on the beeper timer.
+ *
+ * Approach A for passive piezo: hardware square-wave frequency (ARR),
+ * channels time-multiplexed. Duty-PWM amplitude does not work on piezo.
  */
 
 #include <stdbool.h>
@@ -35,17 +37,11 @@
 #include "common/utils.h"
 
 #include "drivers/sound_beeper.h"
-#include "drivers/timer.h"
 
 #include "fc/runtime_config.h"
 
 #include "io/beeper.h"
 #include "io/chiptune.h"
-
-// 8 MHz timebase / 256 period = 31250 Hz PWM carrier == audio sample rate
-#define CHIPTUNE_PWM_HZ         8000000u
-#define CHIPTUNE_PWM_PERIOD     256u
-#define CHIPTUNE_SAMPLE_RATE    (CHIPTUNE_PWM_HZ / CHIPTUNE_PWM_PERIOD)
 
 #define CHIPTUNE_ENGINE_HZ      50
 #define CHIPTUNE_TICKS_PER_ROW  6
@@ -66,35 +62,29 @@
 #define CHIPTUNE_ARP_MIN        1
 #define CHIPTUNE_ARP_MAJ        2
 
-#define CHIPTUNE_MIX_MAX        (3 * 15 + 15)
-
 typedef struct {
-    uint8_t note;   // MIDI note, 0 = gate off
-    uint8_t vol;    // 0..15
+    uint8_t note;
+    uint8_t vol;
 } chiptuneNote_t;
 
 typedef struct {
     chiptuneNote_t ch[CHIPTUNE_CH_COUNT];
-    uint8_t drum;   // CHIPTUNE_DRUM_*
-    uint8_t arp;    // CHIPTUNE_ARP_* applied to channel C root
+    uint8_t drum;
+    uint8_t arp;
 } chiptuneRow_t;
 
 typedef struct {
-    volatile uint32_t phase;
-    volatile uint32_t step;
+    volatile uint16_t freqHz;
     volatile uint8_t volume;
 } chiptuneOsc_t;
 
 static chiptuneOsc_t oscillators[CHIPTUNE_CH_COUNT];
+static volatile uint16_t noiseFreqHz;
 static volatile uint8_t noiseVolume;
-static volatile uint16_t noisePeriod;   // samples between LFSR clocks
-static volatile uint16_t noiseCounter;
 static volatile uint16_t lfsr = 0xACE1u;
 
 static volatile bool playing;
-static timerOvrHandlerRec_t audioOverflowCb;
-static uint16_t pwmPeriod;
-
+static uint8_t muxIndex;
 static uint8_t orderPos;
 static uint8_t row;
 static uint8_t tick;
@@ -103,27 +93,23 @@ static uint8_t noiseDecay;
 static uint8_t currentPattern;
 static timeUs_t nextEngineTimeUs;
 
-// phaseStep = round(freq * 2^32 / 31250), MIDI 36..96
-static const uint32_t phaseSteps[CHIPTUNE_NOTE_COUNT] = {
-    8989386u, 9523923u, 10090245u, 10690242u, 11325917u, 11999391u, 12712912u, 13468861u,
-    14269761u, 15118285u, 16017265u, 16969701u, 17978772u, 19047845u, 20180489u, 21380484u,
-    22651833u, 23998781u, 25425823u, 26937721u, 28539522u, 30236570u, 32034530u, 33939402u,
-    35957544u, 38095691u, 40360978u, 42760967u, 45303666u, 47997563u, 50851646u, 53875442u,
-    57079043u, 60473140u, 64069060u, 67878804u, 71915088u, 76191381u, 80721957u, 85521934u,
-    90607333u, 95995125u, 101703292u, 107750885u, 114158086u, 120946279u, 128138119u, 135757608u,
-    143830176u, 152382763u, 161443913u, 171043868u, 181214666u, 191990251u, 203406585u, 215501770u,
-    228316172u, 241892558u, 256276238u, 271515216u, 287660351u
+// MIDI note -> Hz (rounded), C2..C7
+static const uint16_t noteFreqHz[CHIPTUNE_NOTE_COUNT] = {
+    65, 69, 73, 78, 82, 87, 92, 98, 104, 110, 117, 123,
+    131, 139, 147, 156, 165, 175, 185, 196, 208, 220, 233, 247,
+    262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494,
+    523, 554, 587, 622, 659, 698, 740, 784, 831, 880, 932, 988,
+    1047, 1109, 1175, 1245, 1319, 1397, 1480, 1568, 1661, 1760, 1865, 1976,
+    2093
 };
 
 static const int8_t arpMinor[3] = { 0, 3, 7 };
 static const int8_t arpMajor[3] = { 0, 4, 7 };
 
-// Original demo tune (Am / F / C / G feeling). Newly authored; not from any game/demo.
 #define NV(n, v) { (n), (v) }
 #define ROW(a, av, b, bv, c, cv, drum, arp) { { NV(a, av), NV(b, bv), NV(c, cv) }, (drum), (arp) }
 
 static const chiptuneRow_t pattern0[CHIPTUNE_PATTERN_LEN] = {
-    // Am bar: bass A2/A3, lead motif, Am arp
     ROW(45, 12, 69, 10, 57, 8, CHIPTUNE_DRUM_KICK,  CHIPTUNE_ARP_MIN),
     ROW(57, 10,  0,  0, 57, 8, CHIPTUNE_DRUM_NONE,  CHIPTUNE_ARP_MIN),
     ROW(45, 12, 72, 11, 57, 8, CHIPTUNE_DRUM_HAT,   CHIPTUNE_ARP_MIN),
@@ -132,7 +118,6 @@ static const chiptuneRow_t pattern0[CHIPTUNE_PATTERN_LEN] = {
     ROW(57, 10, 74, 10, 57, 8, CHIPTUNE_DRUM_NONE,  CHIPTUNE_ARP_MIN),
     ROW(45, 12, 72, 11, 57, 8, CHIPTUNE_DRUM_HAT,   CHIPTUNE_ARP_MIN),
     ROW(57, 10,  0,  0, 57, 8, CHIPTUNE_DRUM_NONE,  CHIPTUNE_ARP_MIN),
-    // F bar
     ROW(41, 12, 69, 10, 53, 8, CHIPTUNE_DRUM_KICK,  CHIPTUNE_ARP_MAJ),
     ROW(53, 10,  0,  0, 53, 8, CHIPTUNE_DRUM_NONE,  CHIPTUNE_ARP_MAJ),
     ROW(41, 12, 72, 11, 53, 8, CHIPTUNE_DRUM_HAT,   CHIPTUNE_ARP_MAJ),
@@ -144,7 +129,6 @@ static const chiptuneRow_t pattern0[CHIPTUNE_PATTERN_LEN] = {
 };
 
 static const chiptuneRow_t pattern1[CHIPTUNE_PATTERN_LEN] = {
-    // C bar
     ROW(48, 12, 72, 11, 60, 8, CHIPTUNE_DRUM_KICK,  CHIPTUNE_ARP_MAJ),
     ROW(60, 10,  0,  0, 60, 8, CHIPTUNE_DRUM_NONE,  CHIPTUNE_ARP_MAJ),
     ROW(48, 12, 76, 12, 60, 8, CHIPTUNE_DRUM_HAT,   CHIPTUNE_ARP_MAJ),
@@ -153,7 +137,6 @@ static const chiptuneRow_t pattern1[CHIPTUNE_PATTERN_LEN] = {
     ROW(60, 10, 69, 10, 60, 8, CHIPTUNE_DRUM_NONE,  CHIPTUNE_ARP_MAJ),
     ROW(48, 12, 67, 11, 60, 8, CHIPTUNE_DRUM_HAT,   CHIPTUNE_ARP_MAJ),
     ROW(60, 10,  0,  0, 60, 8, CHIPTUNE_DRUM_NONE,  CHIPTUNE_ARP_MAJ),
-    // G bar
     ROW(43, 12, 71, 11, 55, 8, CHIPTUNE_DRUM_KICK,  CHIPTUNE_ARP_MAJ),
     ROW(55, 10,  0,  0, 55, 8, CHIPTUNE_DRUM_NONE,  CHIPTUNE_ARP_MAJ),
     ROW(43, 12, 74, 12, 55, 8, CHIPTUNE_DRUM_HAT,   CHIPTUNE_ARP_MAJ),
@@ -165,7 +148,6 @@ static const chiptuneRow_t pattern1[CHIPTUNE_PATTERN_LEN] = {
 };
 
 static const chiptuneRow_t pattern2[CHIPTUNE_PATTERN_LEN] = {
-    // Am - G - F - E turnaround
     ROW(45, 13, 69, 12, 57, 9, CHIPTUNE_DRUM_KICK,  CHIPTUNE_ARP_MIN),
     ROW(57, 11, 72, 11, 57, 9, CHIPTUNE_DRUM_HAT,   CHIPTUNE_ARP_MIN),
     ROW(45, 13, 76, 12, 57, 9, CHIPTUNE_DRUM_SNARE, CHIPTUNE_ARP_MIN),
@@ -190,19 +172,18 @@ static const chiptuneRow_t * const patterns[] = {
     pattern2,
 };
 
-// ~24 s loop at 50 Hz / 6 ticks/row
 static const uint8_t order[] = {
     0, 1, 0, 2,
     0, 1, 0, 2,
     0, 1, 0, 2,
 };
 
-static uint32_t noteToStep(uint8_t note)
+static uint16_t noteToFreq(uint8_t note)
 {
     if (note < CHIPTUNE_NOTE_MIN || note > CHIPTUNE_NOTE_MAX) {
         return 0;
     }
-    return phaseSteps[note - CHIPTUNE_NOTE_MIN];
+    return noteFreqHz[note - CHIPTUNE_NOTE_MIN];
 }
 
 static void setChannel(uint8_t index, uint8_t note, uint8_t vol)
@@ -211,11 +192,11 @@ static void setChannel(uint8_t index, uint8_t note, uint8_t vol)
         return;
     }
     if (note == 0 || vol == 0) {
-        oscillators[index].step = 0;
+        oscillators[index].freqHz = 0;
         oscillators[index].volume = 0;
         return;
     }
-    oscillators[index].step = noteToStep(note);
+    oscillators[index].freqHz = noteToFreq(note);
     oscillators[index].volume = vol > 15 ? 15 : vol;
 }
 
@@ -223,20 +204,19 @@ static void triggerDrum(uint8_t drum)
 {
     switch (drum) {
     case CHIPTUNE_DRUM_KICK:
-        noisePeriod = 8;
+        noiseFreqHz = 180;
         noiseVolume = 14;
         noiseDecay = 4;
-        // soft low thump via bass duck into noise-ish pitch
-        oscillators[0].step = noteToStep(36);
+        oscillators[0].freqHz = noteToFreq(36);
         oscillators[0].volume = 12;
         break;
     case CHIPTUNE_DRUM_SNARE:
-        noisePeriod = 2;
+        noiseFreqHz = 1200;
         noiseVolume = 13;
         noiseDecay = 3;
         break;
     case CHIPTUNE_DRUM_HAT:
-        noisePeriod = 1;
+        noiseFreqHz = 4000;
         noiseVolume = 8;
         noiseDecay = 1;
         break;
@@ -281,12 +261,21 @@ static void engineTick(void)
     }
 
     if (noiseDecay && noiseVolume) {
-        // decay once per engine tick while drum is active
         noiseDecay--;
         if (noiseVolume > 2) {
             noiseVolume -= 2;
         } else {
             noiseVolume = 0;
+            noiseFreqHz = 0;
+        }
+        // snare/hat: mild LFSR pitch chatter
+        if (noiseVolume && noiseFreqHz >= 800) {
+            const uint16_t bit = ((lfsr >> 0) ^ (lfsr >> 1)) & 1u;
+            lfsr = (lfsr >> 1) | (bit << 15);
+            if (lfsr == 0) {
+                lfsr = 0xACE1u;
+            }
+            noiseFreqHz = (uint16_t)(800 + (lfsr & 0x7FF));
         }
     }
 
@@ -305,48 +294,32 @@ static void engineTick(void)
 
     debug[0] = currentPattern;
     debug[1] = row;
-    debug[2] = oscillators[1].step ? (int16_t)(oscillators[1].volume) : 0;
+    debug[2] = oscillators[1].freqHz;
     debug[3] = noiseVolume;
 }
 
-static void FAST_CODE chiptuneAudioOverflow(timerOvrHandlerRec_t *cbRec, captureCompare_t capture)
+static void muxOutput(void)
 {
-    UNUSED(cbRec);
-    UNUSED(capture);
+    // Round-robin: noise slot + 3 tone channels. Silent slots are skipped quickly
+    // by advancing until an audible source is found (max one full cycle).
+    for (int attempt = 0; attempt < 4; attempt++) {
+        const uint8_t slot = muxIndex++ & 3u;
 
-    if (!playing) {
-        return;
-    }
-
-    uint16_t mix = 0;
-
-    for (int i = 0; i < CHIPTUNE_CH_COUNT; i++) {
-        oscillators[i].phase += oscillators[i].step;
-        if (oscillators[i].volume && (oscillators[i].phase & 0x80000000u)) {
-            mix += oscillators[i].volume;
-        }
-    }
-
-    if (noiseVolume) {
-        if (noiseCounter) {
-            noiseCounter--;
-        } else {
-            noiseCounter = noisePeriod ? noisePeriod : 1;
-            // 16-bit Fibonacci LFSR (taps 0,1 -> maximal-ish sequence)
-            const uint16_t bit = ((lfsr >> 0) ^ (lfsr >> 1)) & 1u;
-            lfsr = (lfsr >> 1) | (bit << 15);
-            if (lfsr == 0) {
-                lfsr = 0xACE1u;
+        if (slot == 3) {
+            if (noiseVolume && noiseFreqHz) {
+                beeperPwmSetTone(noiseFreqHz, noiseVolume);
+                return;
             }
+            continue;
         }
-        if (lfsr & 1u) {
-            mix += noiseVolume;
+
+        if (oscillators[slot].volume && oscillators[slot].freqHz) {
+            beeperPwmSetTone(oscillators[slot].freqHz, oscillators[slot].volume);
+            return;
         }
     }
 
-    // Scale 0..60 into 0..period (avoid 100% duty)
-    const uint32_t duty = ((uint32_t)mix * (pwmPeriod - 1u)) / CHIPTUNE_MIX_MAX;
-    beeperPwmSetDuty((uint16_t)duty);
+    beeperPwmSetTone(0, 0);
 }
 
 bool chiptuneIsPlaying(void)
@@ -363,11 +336,13 @@ void chiptuneStop(void)
     playing = false;
 
     for (int i = 0; i < CHIPTUNE_CH_COUNT; i++) {
-        oscillators[i].step = 0;
+        oscillators[i].freqHz = 0;
         oscillators[i].volume = 0;
     }
     noiseVolume = 0;
+    noiseFreqHz = 0;
 
+    beeperPwmSetTone(0, 0);
     beeperPwmAudioStop();
 }
 
@@ -389,9 +364,9 @@ bool chiptuneStart(void)
 
     memset((void *)oscillators, 0, sizeof(oscillators));
     noiseVolume = 0;
-    noisePeriod = 1;
-    noiseCounter = 0;
+    noiseFreqHz = 0;
     lfsr = 0xACE1u;
+    muxIndex = 0;
     orderPos = 0;
     row = 0;
     tick = 0;
@@ -400,15 +375,7 @@ bool chiptuneStart(void)
     currentPattern = order[0];
     nextEngineTimeUs = 0;
 
-    timerChannelOverflowHandlerInit(&audioOverflowCb, chiptuneAudioOverflow);
-
-    if (!beeperPwmAudioStart(CHIPTUNE_PWM_HZ, CHIPTUNE_PWM_PERIOD, &audioOverflowCb)) {
-        return false;
-    }
-
-    pwmPeriod = beeperPwmGetPeriod();
-    if (pwmPeriod < 2) {
-        beeperPwmAudioStop();
+    if (!beeperPwmAudioStart(0, 0, NULL)) {
         return false;
     }
 
@@ -435,6 +402,10 @@ void chiptuneUpdate(timeUs_t currentTimeUs)
         engineTick();
         nextEngineTimeUs += (1000000 / CHIPTUNE_ENGINE_HZ);
     }
+
+    // One mux slot per beeper task (~100 Hz): Rapid channel round-robin.
+    // Sounds like a classic single-pin chiptune chord buzz on piezo.
+    muxOutput();
 }
 
 #endif // USE_CHIPTUNE

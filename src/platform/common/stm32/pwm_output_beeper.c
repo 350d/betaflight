@@ -30,6 +30,8 @@
 #include "drivers/sound_beeper.h"
 #include "drivers/timer.h"
 
+#include "common/maths.h"
+
 static pwmOutputPort_t beeperPwm;
 static uint16_t freqBeep = 0;
 
@@ -107,29 +109,50 @@ uint16_t beeperPwmGetPeriod(void)
     if (!beeperTimer) {
         return 0;
     }
-    // timerGetPeriod returns ARR; PWM period counts are ARR+1
     return (uint16_t)(timerGetPeriod(beeperTimer) + 1);
+}
+
+void beeperPwmSetTone(uint16_t freqHz, uint8_t volume015)
+{
+    if (!beeperPwmIsReady() || !beeperAudioMode) {
+        return;
+    }
+
+    if (freqHz == 0 || volume015 == 0) {
+        *beeperPwm.channel.ccr = 0;
+        beeperPwm.enabled = false;
+        return;
+    }
+
+    // Keep within 16-bit ARR at 1 MHz timebase (min ~16 Hz, max 10 kHz practical)
+    freqHz = constrain(freqHz, 16, 10000);
+    const uint16_t period = (uint16_t)(PWM_TIMER_1MHZ / freqHz);
+    const uint16_t maxDuty = period / 2;
+    uint16_t duty = (uint16_t)(((uint32_t)maxDuty * volume015) / 15);
+    if (duty == 0) {
+        duty = 1;
+    }
+
+    pwmOutputConfig(&beeperPwm.channel, beeperTimer, PWM_TIMER_1MHZ, period, duty, 0);
+    *beeperPwm.channel.ccr = duty;
+    beeperPwm.enabled = true;
 }
 
 bool beeperPwmAudioStart(uint32_t hz, uint16_t period, timerOvrHandlerRec_t *overflowCb)
 {
-    if (!beeperPwmIsReady() || !overflowCb || hz == 0 || period < 2) {
+    UNUSED(hz);
+    UNUSED(period);
+    UNUSED(overflowCb);
+
+    if (!beeperPwmIsReady()) {
         return false;
     }
 
+    // Approach A: keep tone-mode timer; chiptune owns output via beeperPwmSetTone().
     beeperAudioMode = true;
-
-    // Fixed-rate PWM carrier; duty carries mixed audio samples.
-    pwmOutputConfig(&beeperPwm.channel, beeperTimer, hz, period, 0, 0);
-
-    // Ensure update IRQ NVIC is enabled (needed for TIM1 UP on F4).
-    timerConfigure(beeperTimer, period, hz);
-    pwmOutputConfig(&beeperPwm.channel, beeperTimer, hz, period, 0, 0);
-
-    timerConfigUpdateCallback(beeperTimer, overflowCb);
-
+    timerConfigUpdateCallback(beeperTimer, NULL);
     *beeperPwm.channel.ccr = 0;
-    beeperPwm.enabled = true;
+    beeperPwm.enabled = false;
     return true;
 }
 
