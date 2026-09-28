@@ -22,14 +22,22 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "common/time.h"
 
 #ifdef USE_CHIPTUNE
 
 bool chiptuneStart(void);
+bool chiptuneStartTest(uint16_t muxHz); // 0 = sweep 500/1000/2000/4000
 void chiptuneStop(void);
 bool chiptuneIsPlaying(void);
+bool chiptuneSetMuxHz(uint16_t muxHz);
+uint16_t chiptuneGetMuxHz(void);
+
+// Tracker / test sequencer (from TASK_BEEPER ~100 Hz)
 void chiptuneUpdate(timeUs_t currentTimeUs);
+// Channel mux (from TASK_CHIPTUNE at mux rate)
+void chiptuneMuxUpdate(timeUs_t currentTimeUs);
 
 #endif // USE_CHIPTUNE

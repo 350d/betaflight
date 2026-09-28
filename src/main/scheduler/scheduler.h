@@ -122,6 +122,9 @@ typedef enum {
 #ifdef USE_BEEPER
     TASK_BEEPER,
 #endif
+#ifdef USE_CHIPTUNE
+    TASK_CHIPTUNE,
+#endif
 #ifdef USE_GPS
     TASK_GPS,
 #endif

@@ -124,16 +124,17 @@ void beeperPwmSetTone(uint16_t freqHz, uint8_t volume015)
         return;
     }
 
-    // Keep within 16-bit ARR at 1 MHz timebase (min ~16 Hz, max 10 kHz practical)
+    // Keep within 16-bit ARR at 1 MHz timebase
     freqHz = constrain(freqHz, 16, 10000);
     const uint16_t period = (uint16_t)(PWM_TIMER_1MHZ / freqHz);
-    const uint16_t maxDuty = period / 2;
-    uint16_t duty = (uint16_t)(((uint32_t)maxDuty * volume015) / 15);
+    uint16_t duty = (uint16_t)(((uint32_t)(period / 2) * volume015) / 15);
     if (duty == 0) {
         duty = 1;
     }
 
-    pwmOutputConfig(&beeperPwm.channel, beeperTimer, PWM_TIMER_1MHZ, period, duty, 0);
+    // Lightweight update — avoid full pwmOutputConfig on every mux slot
+    timerSetPeriod(beeperTimer, period - 1);
+    timerSetCounter(beeperTimer, 0);
     *beeperPwm.channel.ccr = duty;
     beeperPwm.enabled = true;
 }

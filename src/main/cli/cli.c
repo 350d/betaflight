@@ -4961,26 +4961,67 @@ RAM_CODE static void cliChiptune(const char *cmdName, char *cmdline)
     UNUSED(cmdName);
 
     if (isEmpty(cmdline)) {
-        cliPrintLinef("chiptune: %s", chiptuneIsPlaying() ? "playing" : "stopped");
+        cliPrintLinef("chiptune: %s mux=%u", chiptuneIsPlaying() ? "playing" : "stopped", chiptuneGetMuxHz());
         return;
     }
 
-    if (strcasecmp(cmdline, "play") == 0 || strcasecmp(cmdline, "start") == 0) {
+    char *saveptr;
+    char *cmd = strtok_r(cmdline, " ", &saveptr);
+    char *arg = strtok_r(NULL, " ", &saveptr);
+
+    if (strcasecmp(cmd, "stop") == 0) {
+        chiptuneStop();
+        cliPrintLine("chiptune: stop");
+        return;
+    }
+
+    if (strcasecmp(cmd, "play") == 0 || strcasecmp(cmd, "start") == 0) {
         if (chiptuneStart()) {
-            cliPrintLine("chiptune: play");
+            cliPrintLinef("chiptune: play mux=%u", chiptuneGetMuxHz());
         } else {
             cliPrintLine("chiptune: failed (need timer-backed beeper, craft disarmed)");
         }
         return;
     }
 
-    if (strcasecmp(cmdline, "stop") == 0) {
-        chiptuneStop();
-        cliPrintLine("chiptune: stop");
+    if (strcasecmp(cmd, "mux") == 0) {
+        if (!arg) {
+            cliPrintLinef("chiptune mux: %u", chiptuneGetMuxHz());
+            return;
+        }
+        const int hz = atoi(arg);
+        if (!chiptuneSetMuxHz((uint16_t)hz)) {
+            cliPrintLine("chiptune mux: use 100..8000");
+            return;
+        }
+        cliPrintLinef("chiptune mux: %u", chiptuneGetMuxHz());
         return;
     }
 
-    cliPrintLine("usage: chiptune [play|stop]");
+    if (strcasecmp(cmd, "test") == 0) {
+        uint16_t hz = 0;
+        if (arg) {
+            hz = (uint16_t)atoi(arg);
+            if (hz != 0 && (hz < 100 || hz > 8000)) {
+                cliPrintLine("chiptune test: mux 100..8000 or omit for 500/1000/2000/4000 sweep");
+                return;
+            }
+        }
+        if (chiptuneStartTest(hz)) {
+            if (hz) {
+                cliPrintLinef("chiptune test: A4 -> A4+E5 -> A4+E5+A5 @ %u Hz mux", hz);
+            } else {
+                cliPrintLine("chiptune test: sweep mux 500/1000/2000/4000");
+                cliPrintLine("  markers: 1..4 beeps = rate index");
+                cliPrintLine("  then 2s mono A4, 2s A4+E5, 2s A4+E5+A5");
+            }
+        } else {
+            cliPrintLine("chiptune: failed (need timer-backed beeper, craft disarmed)");
+        }
+        return;
+    }
+
+    cliPrintLine("usage: chiptune [play|stop|test [muxHz]|mux <hz>]");
 }
 #endif
 
@@ -8671,7 +8712,7 @@ const clicmd_t cmdTable[] = {
     CLI_COMMAND_DEF("board_name", "get / set the name of the board model", "[board name]", cliBoardName),
 #endif
 #ifdef USE_CHIPTUNE
-    CLI_COMMAND_DEF("chiptune", "experimental beeper PSG demo player", "[play|stop]", cliChiptune),
+    CLI_COMMAND_DEF("chiptune", "experimental beeper PSG demo / mux test", "[play|stop|test [muxHz]|mux <hz>]", cliChiptune),
 #endif
 #ifdef USE_LED_STRIP_STATUS_MODE
         CLI_COMMAND_DEF("color", "configure colors", NULL, cliColor),

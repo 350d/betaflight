@@ -19,9 +19,7 @@
  * If not, see <http://www.gnu.org/licenses/>.
  *
  * Experimental timer-backed 3-channel + noise PSG player.
- *
- * Approach A for passive piezo: hardware square-wave frequency (ARR),
- * channels time-multiplexed. Duty-PWM amplitude does not work on piezo.
+ * Approach A: hardware square-wave frequency, channels time-multiplexed.
  */
 
 #include <stdbool.h>
@@ -34,33 +32,63 @@
 
 #include "build/debug.h"
 
+#include "common/maths.h"
 #include "common/utils.h"
 
 #include "drivers/sound_beeper.h"
+#include "drivers/time.h"
 
 #include "fc/runtime_config.h"
 
 #include "io/beeper.h"
 #include "io/chiptune.h"
 
-#define CHIPTUNE_ENGINE_HZ      50
-#define CHIPTUNE_TICKS_PER_ROW  6
+#include "scheduler/scheduler.h"
 
-#define CHIPTUNE_NOTE_MIN       36   // C2
-#define CHIPTUNE_NOTE_MAX       96   // C7
-#define CHIPTUNE_NOTE_COUNT     (CHIPTUNE_NOTE_MAX - CHIPTUNE_NOTE_MIN + 1)
+#define CHIPTUNE_ENGINE_HZ          50
+#define CHIPTUNE_TICKS_PER_ROW      6
 
-#define CHIPTUNE_CH_COUNT       3
-#define CHIPTUNE_PATTERN_LEN    16
+#define CHIPTUNE_NOTE_MIN           36
+#define CHIPTUNE_NOTE_MAX           96
+#define CHIPTUNE_NOTE_COUNT         (CHIPTUNE_NOTE_MAX - CHIPTUNE_NOTE_MIN + 1)
 
-#define CHIPTUNE_DRUM_NONE      0
-#define CHIPTUNE_DRUM_KICK      1
-#define CHIPTUNE_DRUM_SNARE     2
-#define CHIPTUNE_DRUM_HAT       3
+#define CHIPTUNE_CH_COUNT           3
+#define CHIPTUNE_PATTERN_LEN        16
 
-#define CHIPTUNE_ARP_OFF        0
-#define CHIPTUNE_ARP_MIN        1
-#define CHIPTUNE_ARP_MAJ        2
+#define CHIPTUNE_DRUM_NONE          0
+#define CHIPTUNE_DRUM_KICK          1
+#define CHIPTUNE_DRUM_SNARE         2
+#define CHIPTUNE_DRUM_HAT           3
+
+#define CHIPTUNE_ARP_OFF            0
+#define CHIPTUNE_ARP_MIN            1
+#define CHIPTUNE_ARP_MAJ            2
+
+#define CHIPTUNE_MUX_DEFAULT_HZ     1000
+#define CHIPTUNE_MUX_MIN_HZ         100
+#define CHIPTUNE_MUX_MAX_HZ         8000
+
+#define CHIPTUNE_TEST_NOTE_A4       440
+#define CHIPTUNE_TEST_NOTE_E5       659
+#define CHIPTUNE_TEST_NOTE_A5       880
+#define CHIPTUNE_TEST_PHASE_MS      2000
+#define CHIPTUNE_TEST_GAP_MS        300
+#define CHIPTUNE_TEST_BEEP_MS       120
+#define CHIPTUNE_TEST_BEEP_GAP_MS   80
+
+typedef enum {
+    MODE_DEMO = 0,
+    MODE_TEST,
+} chiptuneMode_e;
+
+typedef enum {
+    TEST_MARK_BEEPS = 0,  // N short beeps = mux-rate index (1..4)
+    TEST_GAP,
+    TEST_ONE,             // A4 only
+    TEST_TWO,             // A4 + E5
+    TEST_THREE,           // A4 + E5 + A5
+    TEST_END_GAP,
+} chiptuneTestPhase_e;
 
 typedef struct {
     uint8_t note;
@@ -84,7 +112,10 @@ static volatile uint8_t noiseVolume;
 static volatile uint16_t lfsr = 0xACE1u;
 
 static volatile bool playing;
+static chiptuneMode_e mode;
 static uint8_t muxIndex;
+static uint16_t muxHz = CHIPTUNE_MUX_DEFAULT_HZ;
+
 static uint8_t orderPos;
 static uint8_t row;
 static uint8_t tick;
@@ -93,7 +124,16 @@ static uint8_t noiseDecay;
 static uint8_t currentPattern;
 static timeUs_t nextEngineTimeUs;
 
-// MIDI note -> Hz (rounded), C2..C7
+// Test sequencer
+static chiptuneTestPhase_e testPhase;
+static uint8_t testRateIndex;
+static uint8_t testRateCount;
+static uint8_t testMarkBeepLeft;
+static bool testMarkOn;
+static timeUs_t testPhaseEndUs;
+static uint16_t activeTestRates[4];
+static const uint16_t defaultTestMuxRates[] = { 500, 1000, 2000, 4000 };
+
 static const uint16_t noteFreqHz[CHIPTUNE_NOTE_COUNT] = {
     65, 69, 73, 78, 82, 87, 92, 98, 104, 110, 117, 123,
     131, 139, 147, 156, 165, 175, 185, 196, 208, 220, 233, 247,
@@ -186,6 +226,16 @@ static uint16_t noteToFreq(uint8_t note)
     return noteFreqHz[note - CHIPTUNE_NOTE_MIN];
 }
 
+static void clearChannels(void)
+{
+    for (int i = 0; i < CHIPTUNE_CH_COUNT; i++) {
+        oscillators[i].freqHz = 0;
+        oscillators[i].volume = 0;
+    }
+    noiseVolume = 0;
+    noiseFreqHz = 0;
+}
+
 static void setChannel(uint8_t index, uint8_t note, uint8_t vol)
 {
     if (index >= CHIPTUNE_CH_COUNT) {
@@ -198,6 +248,26 @@ static void setChannel(uint8_t index, uint8_t note, uint8_t vol)
     }
     oscillators[index].freqHz = noteToFreq(note);
     oscillators[index].volume = vol > 15 ? 15 : vol;
+}
+
+static void setChannelHz(uint8_t index, uint16_t hz, uint8_t vol)
+{
+    if (index >= CHIPTUNE_CH_COUNT) {
+        return;
+    }
+    oscillators[index].freqHz = hz;
+    oscillators[index].volume = (hz && vol) ? (vol > 15 ? 15 : vol) : 0;
+}
+
+static void applyMuxRate(uint16_t hz)
+{
+    muxHz = constrain(hz, CHIPTUNE_MUX_MIN_HZ, CHIPTUNE_MUX_MAX_HZ);
+    rescheduleTask(TASK_CHIPTUNE, TASK_PERIOD_HZ(muxHz));
+}
+
+static void enableMuxTask(bool on)
+{
+    setTaskEnabled(TASK_CHIPTUNE, on);
 }
 
 static void triggerDrum(uint8_t drum)
@@ -244,7 +314,7 @@ static void applyRow(const chiptuneRow_t *r)
     }
 }
 
-static void engineTick(void)
+static void engineTickDemo(void)
 {
     currentPattern = order[orderPos];
     const chiptuneRow_t *r = &patterns[currentPattern][row];
@@ -268,7 +338,6 @@ static void engineTick(void)
             noiseVolume = 0;
             noiseFreqHz = 0;
         }
-        // snare/hat: mild LFSR pitch chatter
         if (noiseVolume && noiseFreqHz >= 800) {
             const uint16_t bit = ((lfsr >> 0) ^ (lfsr >> 1)) & 1u;
             lfsr = (lfsr >> 1) | (bit << 15);
@@ -295,13 +364,105 @@ static void engineTick(void)
     debug[0] = currentPattern;
     debug[1] = row;
     debug[2] = oscillators[1].freqHz;
-    debug[3] = noiseVolume;
+    debug[3] = muxHz;
+}
+
+static void applyTestVoices(uint8_t voiceCount)
+{
+    clearChannels();
+    if (voiceCount >= 1) {
+        setChannelHz(0, CHIPTUNE_TEST_NOTE_A4, 15);
+    }
+    if (voiceCount >= 2) {
+        setChannelHz(1, CHIPTUNE_TEST_NOTE_E5, 15);
+    }
+    if (voiceCount >= 3) {
+        setChannelHz(2, CHIPTUNE_TEST_NOTE_A5, 15);
+    }
+}
+
+static void beginTestRate(timeUs_t nowUs)
+{
+    applyMuxRate(activeTestRates[testRateIndex]);
+    testPhase = TEST_MARK_BEEPS;
+    testMarkBeepLeft = (uint8_t)(testRateIndex + 1);
+    testMarkOn = true;
+    clearChannels();
+    setChannelHz(0, 880, 15);
+    testPhaseEndUs = nowUs + (CHIPTUNE_TEST_BEEP_MS * 1000);
+}
+
+static void engineTickTest(timeUs_t nowUs)
+{
+    if (cmpTimeUs(nowUs, testPhaseEndUs) < 0) {
+        debug[0] = testPhase;
+        debug[1] = testRateIndex;
+        debug[2] = activeTestRates[testRateIndex];
+        debug[3] = muxHz;
+        return;
+    }
+
+    switch (testPhase) {
+    case TEST_MARK_BEEPS:
+        if (testMarkOn) {
+            testMarkOn = false;
+            clearChannels();
+            testPhaseEndUs = nowUs + (CHIPTUNE_TEST_BEEP_GAP_MS * 1000);
+            if (testMarkBeepLeft > 1) {
+                testMarkBeepLeft--;
+            } else {
+                testPhase = TEST_GAP;
+            }
+        } else {
+            testMarkOn = true;
+            setChannelHz(0, 880, 15);
+            testPhaseEndUs = nowUs + (CHIPTUNE_TEST_BEEP_MS * 1000);
+        }
+        break;
+
+    case TEST_GAP:
+        clearChannels();
+        testPhase = TEST_ONE;
+        applyTestVoices(1);
+        testPhaseEndUs = nowUs + (CHIPTUNE_TEST_PHASE_MS * 1000);
+        break;
+
+    case TEST_ONE:
+        testPhase = TEST_TWO;
+        applyTestVoices(2);
+        testPhaseEndUs = nowUs + (CHIPTUNE_TEST_PHASE_MS * 1000);
+        break;
+
+    case TEST_TWO:
+        testPhase = TEST_THREE;
+        applyTestVoices(3);
+        testPhaseEndUs = nowUs + (CHIPTUNE_TEST_PHASE_MS * 1000);
+        break;
+
+    case TEST_THREE:
+        clearChannels();
+        testPhase = TEST_END_GAP;
+        testPhaseEndUs = nowUs + (CHIPTUNE_TEST_GAP_MS * 1000);
+        break;
+
+    case TEST_END_GAP:
+        testRateIndex++;
+        if (testRateIndex >= testRateCount) {
+            chiptuneStop();
+            return;
+        }
+        beginTestRate(nowUs);
+        break;
+    }
+
+    debug[0] = testPhase;
+    debug[1] = testRateIndex;
+    debug[2] = activeTestRates[testRateIndex];
+    debug[3] = muxHz;
 }
 
 static void muxOutput(void)
 {
-    // Round-robin: noise slot + 3 tone channels. Silent slots are skipped quickly
-    // by advancing until an audible source is found (max one full cycle).
     for (int attempt = 0; attempt < 4; attempt++) {
         const uint8_t slot = muxIndex++ & 3u;
 
@@ -322,34 +483,10 @@ static void muxOutput(void)
     beeperPwmSetTone(0, 0);
 }
 
-bool chiptuneIsPlaying(void)
-{
-    return playing;
-}
-
-void chiptuneStop(void)
-{
-    if (!playing) {
-        return;
-    }
-
-    playing = false;
-
-    for (int i = 0; i < CHIPTUNE_CH_COUNT; i++) {
-        oscillators[i].freqHz = 0;
-        oscillators[i].volume = 0;
-    }
-    noiseVolume = 0;
-    noiseFreqHz = 0;
-
-    beeperPwmSetTone(0, 0);
-    beeperPwmAudioStop();
-}
-
-bool chiptuneStart(void)
+static bool chiptuneBegin(chiptuneMode_e startMode, uint16_t startMuxHz)
 {
     if (playing) {
-        return true;
+        chiptuneStop();
     }
 
     if (ARMING_FLAG(ARMED)) {
@@ -362,9 +499,7 @@ bool chiptuneStart(void)
 
     beeperSilence();
 
-    memset((void *)oscillators, 0, sizeof(oscillators));
-    noiseVolume = 0;
-    noiseFreqHz = 0;
+    clearChannels();
     lfsr = 0xACE1u;
     muxIndex = 0;
     orderPos = 0;
@@ -374,13 +509,73 @@ bool chiptuneStart(void)
     noiseDecay = 0;
     currentPattern = order[0];
     nextEngineTimeUs = 0;
+    mode = startMode;
 
     if (!beeperPwmAudioStart(0, 0, NULL)) {
         return false;
     }
 
+    if (startMode == MODE_TEST) {
+        if (startMuxHz == 0) {
+            testRateCount = ARRAYLEN(defaultTestMuxRates);
+            for (uint8_t i = 0; i < testRateCount; i++) {
+                activeTestRates[i] = defaultTestMuxRates[i];
+            }
+        } else {
+            testRateCount = 1;
+            activeTestRates[0] = constrain(startMuxHz, CHIPTUNE_MUX_MIN_HZ, CHIPTUNE_MUX_MAX_HZ);
+        }
+        testRateIndex = 0;
+        beginTestRate(micros());
+    } else {
+        applyMuxRate(startMuxHz ? startMuxHz : muxHz);
+    }
+
     playing = true;
+    enableMuxTask(true);
     return true;
+}
+
+bool chiptuneIsPlaying(void)
+{
+    return playing;
+}
+
+uint16_t chiptuneGetMuxHz(void)
+{
+    return muxHz;
+}
+
+bool chiptuneSetMuxHz(uint16_t hz)
+{
+    if (hz < CHIPTUNE_MUX_MIN_HZ || hz > CHIPTUNE_MUX_MAX_HZ) {
+        return false;
+    }
+    applyMuxRate(hz);
+    return true;
+}
+
+void chiptuneStop(void)
+{
+    if (!playing) {
+        return;
+    }
+
+    playing = false;
+    enableMuxTask(false);
+    clearChannels();
+    beeperPwmSetTone(0, 0);
+    beeperPwmAudioStop();
+}
+
+bool chiptuneStart(void)
+{
+    return chiptuneBegin(MODE_DEMO, muxHz);
+}
+
+bool chiptuneStartTest(uint16_t requestedMuxHz)
+{
+    return chiptuneBegin(MODE_TEST, requestedMuxHz);
 }
 
 void chiptuneUpdate(timeUs_t currentTimeUs)
@@ -394,17 +589,29 @@ void chiptuneUpdate(timeUs_t currentTimeUs)
         return;
     }
 
+    if (mode == MODE_TEST) {
+        engineTickTest(currentTimeUs);
+        return;
+    }
+
     if (nextEngineTimeUs == 0) {
         nextEngineTimeUs = currentTimeUs;
     }
 
     while (cmpTimeUs(currentTimeUs, nextEngineTimeUs) >= 0) {
-        engineTick();
+        engineTickDemo();
         nextEngineTimeUs += (1000000 / CHIPTUNE_ENGINE_HZ);
     }
+}
 
-    // One mux slot per beeper task (~100 Hz): Rapid channel round-robin.
-    // Sounds like a classic single-pin chiptune chord buzz on piezo.
+void chiptuneMuxUpdate(timeUs_t currentTimeUs)
+{
+    UNUSED(currentTimeUs);
+
+    if (!playing) {
+        return;
+    }
+
     muxOutput();
 }
 
