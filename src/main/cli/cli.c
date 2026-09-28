@@ -5011,7 +5011,7 @@ RAM_CODE static void cliChiptune(const char *cmdName, char *cmdline)
             if (ms) {
                 cliPrintLinef("chiptune test: A4-C5-E5 arp dwell=%ums", ms);
             } else {
-                cliPrintLine("chiptune test: A4-C5-E5 arp, dwell sweep 12/16/20/24 ms");
+                cliPrintLine("chiptune test: A4-C5-E5 arp, dwell sweep 24/28/32/40 ms");
                 cliPrintLine("  markers: 1..4 beeps = dwell index");
                 cliPrintLine("  then 3s continuous arp at that dwell");
             }

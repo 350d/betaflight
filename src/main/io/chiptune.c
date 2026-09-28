@@ -57,7 +57,7 @@
 
 #define CHIPTUNE_CH_COUNT           3
 #define CHIPTUNE_PATTERN_LEN        16
-#define CHIPTUNE_ARP_MAX_NOTES      4
+#define CHIPTUNE_ARP_MAX_NOTES      8
 
 #define CHIPTUNE_DRUM_NONE          0
 #define CHIPTUNE_DRUM_KICK          1
@@ -68,7 +68,7 @@
 #define CHIPTUNE_ARP_MIN            1
 #define CHIPTUNE_ARP_MAJ            2
 
-#define CHIPTUNE_DWELL_DEFAULT_MS   20
+#define CHIPTUNE_DWELL_DEFAULT_MS   32
 #define CHIPTUNE_DWELL_MIN_MS       1
 #define CHIPTUNE_DWELL_MAX_MS       100
 
@@ -132,7 +132,7 @@ static uint8_t testMarkBeepLeft;
 static bool testMarkOn;
 static timeUs_t testPhaseEndUs;
 static uint16_t activeTestDwells[4];
-static const uint16_t defaultTestDwells[] = { 12, 16, 20, 24 };
+static const uint16_t defaultTestDwells[] = { 24, 28, 32, 40 };
 
 static const uint16_t noteFreqHz[CHIPTUNE_NOTE_COUNT] = {
     65, 69, 73, 78, 82, 87, 92, 98, 104, 110, 117, 123,
@@ -315,37 +315,43 @@ static void rebuildDemoArp(const chiptuneRow_t *r)
 {
     arpClear();
 
-    // Monophonic voice priority queue for this row: lead, bass, chord tones.
-    if (r->ch[1].note && r->ch[1].vol) {
-        arpAdd(noteToFreq(r->ch[1].note), r->ch[1].vol);
-    }
-    if (r->ch[0].note && r->ch[0].vol) {
-        arpAdd(noteToFreq(r->ch[0].note), r->ch[0].vol);
-    }
+    // Chord tremble is the body of the sound (most slots). Lead is one peek per
+    // cycle so melody is present but does not drown the classic chiptune shimmer.
+    const uint8_t harmVol = 14;
+    const uint8_t bassVol = 12;
+    const uint8_t leadVol = 13;
 
-    if (r->arp != CHIPTUNE_ARP_OFF && r->ch[2].note && r->ch[2].vol) {
+    if (r->arp != CHIPTUNE_ARP_OFF && r->ch[2].note) {
         const int8_t *intervals = (r->arp == CHIPTUNE_ARP_MAJ) ? arpMajor : arpMinor;
         const uint8_t root = r->ch[2].note;
-        for (int i = 0; i < 3 && arpCount < CHIPTUNE_ARP_MAX_NOTES; i++) {
-            const uint8_t n = (uint8_t)(root + intervals[(arpChordStep + i) % 3]);
-            arpAdd(noteToFreq(n), r->ch[2].vol);
+        // Two full triad passes (~6 slots) for continuous background tremble
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < 3; i++) {
+                const uint8_t n = (uint8_t)(root + intervals[(arpChordStep + i) % 3]);
+                arpAdd(noteToFreq(n), harmVol);
+            }
         }
     } else if (r->ch[2].note && r->ch[2].vol) {
-        arpAdd(noteToFreq(r->ch[2].note), r->ch[2].vol);
+        arpAdd(noteToFreq(r->ch[2].note), harmVol);
+        arpAdd(noteToFreq(r->ch[2].note), harmVol);
     }
 
-    if (drumVol && drumFreqHz) {
-        // Insert drum hit as a short dedicated step at the front for this rebuild.
-        if (arpCount < CHIPTUNE_ARP_MAX_NOTES) {
-            // Shift up to make room
-            for (int i = arpCount; i > 0; i--) {
-                arpFreqs[i] = arpFreqs[i - 1];
-                arpVols[i] = arpVols[i - 1];
-            }
-            arpFreqs[0] = drumFreqHz;
-            arpVols[0] = drumVol;
-            arpCount++;
+    if (r->ch[0].note && r->ch[0].vol) {
+        arpAdd(noteToFreq(r->ch[0].note), bassVol);
+    }
+
+    if (r->ch[1].note && r->ch[1].vol) {
+        arpAdd(noteToFreq(r->ch[1].note), leadVol);
+    }
+
+    if (drumVol && drumFreqHz && arpCount < CHIPTUNE_ARP_MAX_NOTES) {
+        for (int i = arpCount; i > 0; i--) {
+            arpFreqs[i] = arpFreqs[i - 1];
+            arpVols[i] = arpVols[i - 1];
         }
+        arpFreqs[0] = drumFreqHz;
+        arpVols[0] = drumVol;
+        arpCount++;
     }
 
     arpIndex = 0;
