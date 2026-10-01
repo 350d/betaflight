@@ -53,7 +53,6 @@
 #include "io/displayport_max7456.h"
 
 #ifdef USE_CHIPTUNE
-#include "drivers/sound_beeper.h"
 #include "io/chiptune.h"
 #endif
 
@@ -94,6 +93,7 @@
 #define OSD_DEMO_FX_WIPE_MS         10000
 #define OSD_DEMO_FX_TUNNEL_MS       20000
 #define OSD_DEMO_FX_PLASMA2X2_MS   18000
+#define OSD_DEMO_FX_TWISTER_MS     18000
 #define OSD_DEMO_FIRE_IGNITE_MS     1500
 #define OSD_DEMO_FIRE_FALL_TICKS    4   // ticks per collapsed row (~1.1s for 16 rows @ 72Hz)
 #define OSD_DEMO_FIRE_STEP_TICKS    3   // flame physics ~24Hz @ SCROLL_HZ (was every tick)
@@ -104,26 +104,7 @@
 #define OSD_DEMO_FIRE_CURVE_ROWS    2
 #define OSD_DEMO_FIRE_CURVE_MAX_PX  OSD_DEMO_CELL_H // bend profile 0..18 on row 1
 
-// Scene 7 (CLI-only, not in auto cycle): mid-raster Display SRAM rewrite probe.
-#define OSD_DEMO_RASTER_DEFAULT_X       15
-#define OSD_DEMO_RASTER_DEFAULT_Y       8
-// Strict PAL field length on this F411 @ 108 MHz DWT. Never retune this to
-// paper over scheduler lateness — use periodCorrectionTicks (fine) only.
-#define OSD_DEMO_RASTER_NOMINAL_PERIOD_TICKS  2160000u
-#define OSD_DEMO_RASTER_NOMINAL_FIELD_US      20000u
-#define OSD_DEMO_RASTER_CORR_MAX_US           1000   // fine cal only (±1 ms)
-#define OSD_DEMO_RASTER_CORR_DEFAULT_US       0      // VSYNC lock does not need period corr
-#define OSD_DEMO_RASTER_DEFAULT_PHASE_US 16512  // user-tuned mid-glyph window
-#define OSD_DEMO_RASTER_DELAY_MAX_US    20000  // ~1 PAL character-row window budget
-#define OSD_DEMO_RASTER_SWEEP_STEP_US   1
-#define OSD_DEMO_RASTER_ATTR_INV        0x01   // per-cell attribute bit0
 #define OSD_DEMO_CHARS_PER_LINE         30
-// If A is already this late, skip the field — collapsed A→B looks like blink.
-#define OSD_DEMO_RASTER_LATE_SKIP_US    200
-#define OSD_DEMO_RASTER_MARK_X          15
-#define OSD_DEMO_RASTER_MARK_Y          0     // top row — impossible to miss
-#define OSD_DEMO_RASTER_MARK_INTERVAL_DEFAULT 500
-#define OSD_DEMO_RASTER_MARK_FLASH_HOLD 3     // keep WHITE this many fields (visible on 30fps capture)
 
 typedef enum {
     OSD_DEMO_FX_SCROLLER = 0,
@@ -132,27 +113,8 @@ typedef enum {
     OSD_DEMO_FX_WIPE,
     OSD_DEMO_FX_TUNNEL,
     OSD_DEMO_FX_PLASMA2X2, // scene 7 — 2×2 mid-glyph plasma
-    OSD_DEMO_FX_RASTER,     // experimental — enter via `osd_demo raster`, never auto-cycle
-    OSD_DEMO_FX_HOSTEST,    // mid-scanline HOS poke — CLI `osd_demo hostest`
+    OSD_DEMO_FX_TWISTER,    // scene 8 — classic B/W ribbon twister (CLI scene8/twister)
 } osdDemoFx_e;
-
-typedef enum {
-    OSD_DEMO_RASTER_GLYPH = 0,  // switch character index mid-cell
-    OSD_DEMO_RASTER_INVERT,     // switch per-cell INV attribute mid-cell
-    OSD_DEMO_RASTER_SWEEP,      // glyph mode + auto-increment delay
-    OSD_DEMO_RASTER_CAL,        // boot-button sync calibrator (mega-pixel UI)
-    OSD_DEMO_RASTER_MARK,       // blink every N software fields (period self-check)
-    OSD_DEMO_RASTER_VSYNC,      // lock A→B to MAX7456 STAT[4] VSYNC falling edge
-    OSD_DEMO_RASTER_DIAG,       // VSYNC + cumulative diagonal hatch in one cell
-    OSD_DEMO_RASTER_FILL,       // VSYNC + mid-glyph hatch across every character row
-} osdDemoRasterMode_e;
-
-#define OSD_DEMO_CAL_CENTER_INIT_US  16512
-#define OSD_DEMO_CAL_RANGE_INIT_US   1000
-#define OSD_DEMO_CAL_RANGE_MIN_US    50
-#define OSD_DEMO_CAL_SWEEP_MS        8000   // slow full triangle ±range (~8s)
-#define OSD_DEMO_CAL_TEXT_ROWS       3
-#define OSD_DEMO_CAL_DIGIT_ADV       6     // 5×5 font @ 6×6 mega-pixels
 
 typedef enum {
     OSD_DEMO_FIRE_COLLAPSE = 0,
@@ -175,6 +137,9 @@ static uint16_t textPixelCols;
 static timeUs_t lastStepUs;
 static timeMs_t bounceStartMs;
 static timeMs_t fxStartMs;
+// Started by scene name from the CLI: stay on this scene (no auto-cycle). Mid-glyph scenes
+// (7, 8) just keep running; time-phased scenes restart themselves every period.
+static bool fxHold;
 static osdDemoFx_e fx;
 static uint16_t prevBouncePhase;
 static bool punchArmed;
@@ -186,74 +151,13 @@ static uint8_t prevRowBright[OSD_DEMO_RB_ROWS];
 static osdDemoStar_t stars[OSD_DEMO_STAR_LAYERS][OSD_DEMO_STARS_PER_LAYER];
 static uint16_t starFine[OSD_DEMO_STAR_LAYERS]; // absolute leftward px; synced to HOS
 
-// Raster timing probe (CLI) — Display SRAM only, no NVM/font writes.
-static osdDemoRasterMode_e rasterMode;
-static uint8_t rasterX = OSD_DEMO_RASTER_DEFAULT_X;
-static uint8_t rasterY = OSD_DEMO_RASTER_DEFAULT_Y;
-static uint16_t rasterDelayUs = 0;
-static uint8_t rasterGlyphA = OSD_DEMO_FILL_BASE;     // full white 12x18
-static uint8_t rasterGlyphB = OSD_DEMO_PIXEL_OFF;     // full black 12x18
-static uint8_t rasterInvGlyph = (uint8_t)(OSD_DEMO_HFILL_BASE + 9); // asymmetric top-white
-static timeUs_t rasterLastPulseUs;
-static bool rasterStaticPainted;
-
-// CAL: CLI-only sync calibrator (catch/commit/reset). Moving bar = delay within ±range.
-static uint16_t calCenterUs;
-static uint16_t calRangeUs;
-static int16_t calOffsetUs;          // -range..+range
-static int8_t calSweepDir;           // +1 / -1 triangle
-static uint16_t calDynamicUs;        // center+offset (clamped), applied as pulse delay
-static timeMs_t calSweepLastMs;
-static uint32_t calSweepPhaseMs;     // 0 .. OSD_DEMO_CAL_SWEEP_MS (triangle phase)
-static uint8_t calLastDynSlot;       // last painted mover column (skip redraw if unchanged)
-static bool calUiForce;
-
-// DWT CYCCNT software oscillator — ideal grid. SPI A/B fire inside a
-// deterministic busy-wait on CYCCNT (not on the next OSD-task schedule).
-static int32_t periodCorrectionTicks; // fine only; effective = NOMINAL + corr
-static bool periodCorrSeeded;
-static uint32_t rasterPhaseTicks;    // A→B offset from field epoch
-static uint32_t rasterFieldEpoch;    // absolute DWT tick of current field start
-static uint32_t rasterLateCount;
-static uint32_t rasterMaxLateTicks;
-static bool rasterEngineArmed;
-
-// MARK: compare one short mid-glyph rewrite at event 0 vs event N (same phaseTicks).
-static uint32_t rasterEventCounter;
-static uint16_t markInterval = OSD_DEMO_RASTER_MARK_INTERVAL_DEFAULT;
-static bool markRepeat;
-static bool markTestActive;
-static uint32_t markStartEvent;
-static uint32_t markStartTick;
-static uint32_t markEndEvent;
-static uint32_t markEndTick;
-static uint32_t markLateEvents;
-static uint32_t markMaxLateTicks;
-static bool markPairComplete;
-static uint32_t markExpectedElapsedTicks;
-static int32_t markElapsedErrorTicks;
-static int32_t markErrorPerEventTicks;
-
-// VSYNC lock via STAT[4] SPI poll (no physical VSYNC pin).
-static uint32_t vsyncLockCount;
-static uint32_t vsyncTimeoutCount;
-static uint32_t vsyncLastEdgeTicks;
-#define OSD_DEMO_RASTER_VSYNC_TIMEOUT_US  30000
-#define OSD_DEMO_RASTER_LINE_US_DEFAULT   64    // PAL line ≈ 64 us
-#define OSD_DEMO_RASTER_GLYPH_ROWS        18    // MAX7456 character height
-// Small SPI lead kept for non-HSYNC paths; diag uses HSYNC edges instead.
-#define OSD_DEMO_RASTER_SPI_LEAD_US_DEFAULT  24
-// VSYNC→row0 top. Calibrated so Y=8, line=64 → 1504+8*18*64 = 10720 (user).
-#define OSD_DEMO_RASTER_VBLANK_US         1504
-#define OSD_DEMO_RASTER_DIAG_DEFAULT_PHASE_US  10720 // legacy fallback; prefer auto
-// PAL field = 312.5 lines; lineTicks = fieldTicks * 2 / 625 (stats only).
-#define OSD_DEMO_RASTER_PAL_FIELD_LINES_X2  625
-
-static uint16_t rasterLineUs = OSD_DEMO_RASTER_LINE_US_DEFAULT;
-static uint16_t rasterSpiLeadUs = OSD_DEMO_RASTER_SPI_LEAD_US_DEFAULT;
-static bool rasterPhaseAuto; // recompute phase from cell Y + line_us
-static uint32_t rasterMeasuredLineTicks; // from VSYNCΔ (stats); diag steps use line_us
-static uint8_t rasterFieldParity; // PAL interlaced odd/even → ±½ line
+// PAL timing shared by the mid-glyph engines (scene 7 / scene 8).
+#define OSD_DEMO_PAL_VSYNC_TIMEOUT_US  30000
+#define OSD_DEMO_PAL_LINE_US           64    // PAL line ≈ 64 us
+// VSYNC→row0 top (calibrated: Y=8, line=64 → 1504 + 8*18*64 = 10720 us).
+#define OSD_DEMO_PAL_VBLANK_US         1504
+// PAL field = 312.5 lines.
+#define OSD_DEMO_PAL_FIELD_LINES_X2    625
 
 static uint8_t hosSteps; // 1..HOS_SOFT_PX, right-bias soft-scroll range
 static uint32_t rngState;
@@ -292,8 +196,8 @@ static uint8_t tunnelMh;
 #define OSD_DEMO_PLASMA2X2_BANDS  (OSD_DEMO_CHECKER_CELL_H / OSD_DEMO_PLASMA2X2_STEP) // 9
 // Odd-line tear window: full 30-cell row @20 MHz ≈ 28–36 us. Budget must
 // cover overhead so the burst FINISHES before the lit even line (due).
-#define OSD_DEMO_PLASMA2X2_BURST_US  36
-#define OSD_DEMO_PLASMA2X2_ODD_PAD_US 4  // keep clear of odd/even edges
+// Build the next band only if at least this long remains before the HSYNC of line due−1.
+#define OSD_DEMO_PLASMA2X2_PREFETCH_US 40
 // Classic plasma wave coeffs — wide contour bands on 180×144 2×2 grid.
 #define OSD_DEMO_PLASMA2X2_KX     3
 #define OSD_DEMO_PLASMA2X2_KY     2
@@ -316,18 +220,107 @@ static bool hosWrappedThisStep; // scrollFine wrap → defer HOS until SPI pass 
 static uint8_t plasmaPhase;    // uint8 sine phase — wrap 255→0 is seamless
 static uint8_t plasmaPhaseDiv; // advance phase every 2 fields (smooth, no >>1 jump)
 static bool plasma2x2Armed; // mid-glyph PAL engine for scene 7
-static uint8_t plasmaPrevPack[OSD_DEMO_CHECKER_COLS]; // dirty: last written mask 0..63
 
-// Mid-scanline HOS probe: absolute register poke (no framebuffer touch after paint).
-// Keep A left of centre so B=+16px does not clip the right-edge fiducial.
-#define OSD_DEMO_HOSTEST_HOS_A          16  // left reference
-#define OSD_DEMO_HOSTEST_HOS_B          32  // +16 px right
-#define OSD_DEMO_HOSTEST_DEFAULT_CHAR_Y 8   // character row for the kink
-#define OSD_DEMO_HOSTEST_DEFAULT_PY     9   // mid-glyph pixel row (0..17)
-static bool hosTestArmed;
-static uint8_t hosTestField; // phase counter for A-hold / B-hold / mid-poke
-static uint16_t hosTestLine = (uint16_t)(OSD_DEMO_HOSTEST_DEFAULT_CHAR_Y * OSD_DEMO_CELL_H
-                                         + OSD_DEMO_HOSTEST_DEFAULT_PY);
+// Scene 8 — classic vertical twister: rotating square cross-section → 4 projected edges.
+// Mid-glyph rewrite: 9 vertical logical px/cell (12×2). Bend is geometric (centerX), not
+// mid-field HOS. Always rewrite the full silhouette window — trimming the burst leaves
+// stale wide glyphs on the right and reads as torn corners at the end of each band.
+#define OSD_DEMO_TWISTER_AMP_PX         56
+#define OSD_DEMO_TWISTER_LINE_SPAN      288
+#define OSD_DEMO_TWISTER_TWIST_NUM      256
+#define OSD_DEMO_TWISTER_ROT_STEP       1
+// Geometric sway = two fixed-wavelength sines drifting at different speeds (A + B ≤ AMP).
+#define OSD_DEMO_TWISTER_BEND_AMP       12   // total sway px (±), sizes the SPI window margin
+#define OSD_DEMO_TWISTER_BEND_AMP_A     8
+#define OSD_DEMO_TWISTER_BEND_AMP_B     4
+#define OSD_DEMO_TWISTER_BEND_WAVE_A    140  // lines per period
+#define OSD_DEMO_TWISTER_BEND_WAVE_B    90
+#define OSD_DEMO_TWISTER_BEND_ROT_STEP  3    // wave A phase per field
+#define OSD_DEMO_TWISTER_BEND_FLOAT_STEP 2   // wave B phase per field (opposite direction)
+#define OSD_DEMO_TWISTER_BAND_PX        2    // 12×2; smooth ribbon curves
+#define OSD_DEMO_TWISTER_PAD_US         8
+#define OSD_DEMO_TWISTER_WR_LEAD_US     2
+#define OSD_DEMO_TWISTER_BURST_US       30
+#define OSD_DEMO_TWISTER_WIN_MARGIN_PX  (12 + OSD_DEMO_TWISTER_BEND_AMP)
+// PX22 0x40..0x7F during scene: k=1..11 partials (solids via FILL/OFF/plasma dither).
+#define OSD_DEMO_TWISTER_XFILL_W_BASE   0x40 // 11: left k white | black
+#define OSD_DEMO_TWISTER_XFILL_D_BASE   0x4B // 11: left k dither | black
+#define OSD_DEMO_TWISTER_XFILL_DT_BASE  0x56 // 11: left k black | dither
+#define OSD_DEMO_TWISTER_XFILL_WT_BASE  0x61 // 11: left k black | white (no INV)
+#define OSD_DEMO_TWISTER_XFILL_WD_BASE  0x6C // 11: left k white | dither
+#define OSD_DEMO_TWISTER_XFILL_DW_BASE  0x77 // 9:  left k dither | white (k=1..9)
+#define OSD_DEMO_TWISTER_XFILL_DW_MAX_K 9
+#define OSD_DEMO_TWISTER_GLYPH_W        OSD_DEMO_FILL_BASE
+#define OSD_DEMO_TWISTER_GLYPH_B        OSD_DEMO_PIXEL_OFF
+// Same TL=WHITE checker as our XFILL dither builders (plasma 0xEE).
+#define OSD_DEMO_TWISTER_GLYPH_D        ((uint8_t)(OSD_DEMO_PLASMA_BASE + 3))
+enum {
+    OSD_DEMO_TWISTER_C_B = 0,
+    OSD_DEMO_TWISTER_C_W = 1,
+    OSD_DEMO_TWISTER_C_D = 2,
+};
+static bool twisterArmed;
+static uint8_t twisterPhase;
+static uint8_t twisterBendPhase;
+static uint8_t twisterBendFloat;
+static uint8_t twisterGlyphBuf[2][OSD_DEMO_CHARS_PER_LINE];
+// Display-SRAM mirror for the twister rows: lets each band send only the changed cells.
+#define OSD_DEMO_MG_ROWS_MAX       16
+#define OSD_DEMO_MG_RUN_MERGE_GAP  2    // bridge ≤2 clean cells instead of a new run header
+#define OSD_DEMO_MG_BURST_FIXED_US 2    // spiSequence + CS overhead per burst
+#define OSD_DEMO_MG_LINE_IIR_SHIFT 5    // ~32-field time constant on the measured line period
+static uint8_t mgSram[OSD_DEMO_MG_ROWS_MAX][OSD_DEMO_CHARS_PER_LINE];
+static uint32_t mgLineQ16;       // measured PAL line period, DWT ticks << 16
+// Lines per field ×2 used to turn VSYNC→VSYNC into a line period. 625 = interlaced PAL;
+// many FPV cameras send progressive 313-line (626) or 312-line (624) fields: same 20 ms,
+// different line → row timing drifts linearly away from the calibration row.
+static uint16_t mgFieldHalfLines = OSD_DEMO_PAL_FIELD_LINES_X2;
+static int16_t mgShiftUs;        // constant write-time shift (CLI twshift)
+// Interlace: both fields of one frame must carry the same geometry, otherwise the monitor
+// weaves two different ribbons line-by-line and edges show square notches. Advance the
+// animation once per frame (2 fields, doubled step); pair parity selectable (CLI twpair).
+#define OSD_DEMO_TWISTER_PAIR_OFF       2
+static uint8_t twisterPairParity;     // 0/1 = advance on even/odd field, 2 = every field
+static bool twisterFreeze;            // CLI twfreeze: still frame for diagnosis
+// HSYNC lock: per char row, the measured beam phase relative to row 1 (DWT ticks, IIR).
+// Row bands of row r are scheduled with mgRowCorr[r] added, so a beam-vs-model drift
+// can never accumulate over more than one character row.
+static bool mgHsyncLock = true;
+static int32_t mgRowCorr[OSD_DEMO_MG_ROWS_MAX];
+static uint8_t mgRowCorrN[OSD_DEMO_MG_ROWS_MAX];
+static uint32_t mgHsyncMiss;
+static uint32_t mgFieldLastTicks; // raw VSYNC→VSYNC, accepted or not
+static uint32_t mgFieldReject;
+static bool mgLineSeeded;
+// VBLANK_US was calibrated at the top of char row 8 — pivot the line-period model there so
+// changing the period does not move that calibrated row.
+#define OSD_DEMO_MG_PIVOT_LINE     (8u * OSD_DEMO_CELL_H)
+static uint32_t mgLastEdgeTicks;
+static uint32_t mgByteTicksQ8;   // learned SPI cost per byte, DWT ticks << 8
+static uint32_t mgBurstFixedTicks;
+static uint32_t mgStatFields;
+static uint32_t mgStatWrites;
+static uint32_t mgStatSkips;
+static uint16_t mgStatMaxBytes;
+static uint16_t mgStatSkipRow[OSD_DEMO_MG_ROWS_MAX];
+static uint32_t mgStatIdleTicks;
+static uint32_t mgStatBytes;
+static uint32_t mgStatSlowBursts;  // bursts stretched by an IRQ (not learned from)
+static uint8_t mgSlowRun;
+// Beam position model for race-the-beam writes (scene 7): HSYNC falling edge → first OSD
+// pixel, and one 12-px cell. 360 OSD px span ~53 us of the active line (27 MHz / 4 pixel
+// clock) → 1.778 us per cell. x0 is tunable live (CLI mgbeam); the window per cell is a
+// whole line, so ±15 us of error here is tolerated.
+#define OSD_DEMO_MG_BEAM_X0_US_DEFAULT  10
+#define OSD_DEMO_MG_BEAM_CELL_NS        1778
+#define OSD_DEMO_MG_CHASE_MARGIN_US     3
+static int16_t mgBeamX0Us = OSD_DEMO_MG_BEAM_X0_US_DEFAULT;
+static int32_t mgHsyncPhase;     // THIS field: HSYNC edge − model line start, wrapped ±½ line
+static int32_t mgHsyncPhaseBy[2]; // last measured phase per field parity (fallback on a miss)
+static bool mgHsyncPhaseByValid[2];
+static bool mgFieldFirst;        // this field is field 1 (HSYNC aligned with the VSYNC edge)
+#define OSD_DEMO_MG_FIELD_PHASE_LINES 13 // measure in VBLANK, after the equalizing pulses
+
 
 static uint8_t fireHeat[OSD_DEMO_FIRE_ROWS][OSD_DEMO_FIRE_COLS];
 static uint8_t fireTipFine[OSD_DEMO_FIRE_COLS]; // 0..STAR_FRAMES-1 pixel phase for tip stars
@@ -433,49 +426,112 @@ static uint32_t osdDemoRand(void)
     return x;
 }
 
-static bool osdDemoInstallFont(void)
+// Every demo glyph is a simple mask — build them at install time instead of
+// storing 54-byte NVM payloads in flash. Pixels: 00 black, 10 white, 01 transparent.
+#define OSD_DEMO_PX_B 0u
+#define OSD_DEMO_PX_T 1u
+#define OSD_DEMO_PX_W 2u
+
+typedef enum {
+    OSD_DEMO_GEN_BLANK = 0,
+    OSD_DEMO_GEN_EFFECT,    // 0xC0.. : off, 18 fills, stars ×2 sizes, plasma dithers, streaks
+    OSD_DEMO_GEN_HFILL,     // top k rows white over transparent
+    OSD_DEMO_GEN_HFILL_BOT, // bottom k rows white over transparent
+    OSD_DEMO_GEN_TUNNEL,    // 2×3 mega-pixels of 6×6, bit = 2*row + col
+    OSD_DEMO_GEN_PX22,      // 6 columns of 2 px, all rows
+} osdDemoGlyphGen_e;
+
+static uint8_t osdDemoEffectPixel(uint8_t idx, uint8_t r, uint8_t c)
+{
+    if (idx == 0) {
+        return OSD_DEMO_PX_B;                                   // PIXEL_OFF
+    }
+    if (idx <= OSD_DEMO_SOFT_STEPS) {
+        return (r < idx - 1u) ? OSD_DEMO_PX_B : OSD_DEMO_PX_W;  // FILL_BASE + k: k black rows on top
+    }
+    const int8_t col = (int8_t)c;
+    if (idx < OSD_DEMO_STAR3_BASE - OSD_DEMO_GLYPH_BASE) {      // 2×2 star, 12 frames
+        const int8_t x0 = (int8_t)(10 - (idx - (OSD_DEMO_STAR2_BASE - OSD_DEMO_GLYPH_BASE)));
+        return (r >= 8 && r <= 9 && col >= x0 && col < x0 + 2) ? OSD_DEMO_PX_W : OSD_DEMO_PX_B;
+    }
+    if (idx < OSD_DEMO_PLASMA_BASE - OSD_DEMO_GLYPH_BASE) {     // 3×3 star, 12 frames
+        const int8_t x0 = (int8_t)(9 - (idx - (OSD_DEMO_STAR3_BASE - OSD_DEMO_GLYPH_BASE)));
+        return (r >= 7 && r <= 9 && col >= x0 && col < x0 + 3) ? OSD_DEMO_PX_W : OSD_DEMO_PX_B;
+    }
+    bool on;
+    switch (idx - (OSD_DEMO_PLASMA_BASE - OSD_DEMO_GLYPH_BASE)) {
+    case 0: on = (r % 3u == 0) && (c % 3u == 0); break;        // plasma dither levels
+    case 1: on = (r % 2u == 0) && (c % 3u == 0); break;
+    case 2: on = (r % 2u == 0) && (c % 2u == 0); break;
+    case 3: on = ((r + c) & 1u) == 0; break;
+    case 4: return (r == 17) ? OSD_DEMO_PX_W : OSD_DEMO_PX_T; // STREAK_BOT1
+    case 5: return (r >= 16) ? OSD_DEMO_PX_W : OSD_DEMO_PX_T; // STREAK_BOT2
+    default: return (r == 0) ? OSD_DEMO_PX_W : OSD_DEMO_PX_T; // STREAK_TOP1
+    }
+    return on ? OSD_DEMO_PX_W : OSD_DEMO_PX_B;
+}
+
+static uint8_t osdDemoGenPixel(osdDemoGlyphGen_e kind, uint8_t idx, uint8_t r, uint8_t c)
+{
+    switch (kind) {
+    case OSD_DEMO_GEN_EFFECT:
+        return osdDemoEffectPixel(idx, r, c);
+    case OSD_DEMO_GEN_HFILL:
+        return (r < idx) ? OSD_DEMO_PX_W : OSD_DEMO_PX_T;
+    case OSD_DEMO_GEN_HFILL_BOT:
+        return (r >= OSD_DEMO_CELL_H - idx) ? OSD_DEMO_PX_W : OSD_DEMO_PX_T;
+    case OSD_DEMO_GEN_TUNNEL:
+        return ((idx >> (2u * (r / 6u) + c / 6u)) & 1u) ? OSD_DEMO_PX_W : OSD_DEMO_PX_B;
+    case OSD_DEMO_GEN_PX22:
+        return ((idx >> (c / 2u)) & 1u) ? OSD_DEMO_PX_W : OSD_DEMO_PX_B;
+    default:
+        return OSD_DEMO_PX_T;
+    }
+}
+
+static bool osdDemoWriteGenGlyph(uint8_t addr, osdDemoGlyphGen_e kind, uint8_t idx)
+{
+    uint8_t nvm[OSD_DEMO_GLYPH_BYTES];
+    uint8_t *dst = nvm;
+    for (uint8_t r = 0; r < OSD_DEMO_CELL_H; r++) {
+        for (uint8_t c = 0; c < 12; c += 4) {
+            uint8_t v = 0;
+            for (uint8_t k = 0; k < 4; k++) {
+                v = (uint8_t)((v << 2) | osdDemoGenPixel(kind, idx, r, (uint8_t)(c + k)));
+            }
+            *dst++ = v;
+        }
+    }
+    return max7456WriteNvm(addr, nvm);
+}
+
+static bool osdDemoWritePx22Glyphs(void)
 {
     bool ok = true;
-
-    // Undo older demos that stomped SYM_BLANK (0x20) — BF fills the screen with it.
-    if (!max7456WriteNvm(0x20, osdDemoBlankNvm)) {
-        ok = false;
+    for (uint8_t i = 0; ok && i < OSD_DEMO_PX22_GLYPHS; i++) {
+        ok = osdDemoWriteGenGlyph((uint8_t)(OSD_DEMO_PX22_BASE + i), OSD_DEMO_GEN_PX22, i);
     }
-    for (uint16_t i = 0; ok && i < OSD_DEMO_GLYPH_COUNT; i++) {
-        if (!max7456WriteNvm((uint8_t)(OSD_DEMO_GLYPH_BASE + i), osdDemoGlyphNvm[i])) {
-            ok = false;
-        }
+    return ok;
+}
+
+static bool osdDemoInstallFont(void)
+{
+    // Undo older demos that stomped SYM_BLANK (0x20) — BF fills the screen with it.
+    bool ok = osdDemoWriteGenGlyph(0x20, OSD_DEMO_GEN_BLANK, 0);
+    for (uint8_t i = 0; ok && i < OSD_DEMO_GLYPH_COUNT; i++) {
+        ok = osdDemoWriteGenGlyph((uint8_t)(OSD_DEMO_GLYPH_BASE + i), OSD_DEMO_GEN_EFFECT, i);
     }
     for (uint8_t i = 0; ok && i < OSD_DEMO_HFILL_STEPS; i++) {
-        if (!max7456WriteNvm((uint8_t)(OSD_DEMO_HFILL_BASE + i), osdDemoHFillNvm[i])) {
-            ok = false;
-        }
-        if (ok && !max7456WriteNvm((uint8_t)(OSD_DEMO_HFILL_BOT_BASE + i), osdDemoHFillBotNvm[i])) {
-            ok = false;
-        }
+        ok = osdDemoWriteGenGlyph((uint8_t)(OSD_DEMO_HFILL_BASE + i), OSD_DEMO_GEN_HFILL, i)
+          && osdDemoWriteGenGlyph((uint8_t)(OSD_DEMO_HFILL_BOT_BASE + i), OSD_DEMO_GEN_HFILL_BOT, i);
     }
-    for (uint8_t i = 0; ok && i < OSD_DEMO_STRIPE_COUNT; i++) {
-        if (!max7456WriteNvm((uint8_t)(OSD_DEMO_STRIPE_BASE + i), osdDemoStripeNvm[i])) {
-            ok = false;
-        }
-    }
-    for (uint8_t i = 0; ok && i < OSD_DEMO_PX22_GLYPHS; i++) {
-        if (!max7456WriteNvm((uint8_t)(OSD_DEMO_PX22_BASE + i), osdDemoPx22Nvm[i])) {
-            ok = false;
-        }
-    }
+    ok = ok && osdDemoWritePx22Glyphs();
     for (uint8_t i = 0; ok && i < OSD_DEMO_TUNNEL_GLYPHS; i++) {
         uint8_t addr = (uint8_t)(OSD_DEMO_TUNNEL_BASE + i);
         if (addr == OSD_DEMO_TUNNEL_BLANK_IDX) {
             addr = OSD_DEMO_TUNNEL_ALT; // keep SYM_BLANK transparent
         }
-        if (!max7456WriteNvm(addr, osdDemoTunnelNvm[i])) {
-            ok = false;
-        }
-    }
-    // Tunnel loop may have written 0x00..0x3F; force SYM_BLANK back to transparent.
-    if (ok && !max7456WriteNvm(OSD_DEMO_TUNNEL_BLANK_IDX, osdDemoBlankNvm)) {
-        ok = false;
+        ok = osdDemoWriteGenGlyph(addr, OSD_DEMO_GEN_TUNNEL, i);
     }
     // Always clear fontIsLoading — WriteNvm leaves it set until EndFontWrite.
     max7456EndFontWrite();
@@ -662,66 +718,33 @@ static void osdDemoPaintFire(void);
 static void osdDemoPaintWipe(void);
 static void osdDemoPaintTunnel(void);
 static void osdDemoPlasma2x2EnginePoll(void);
-static void osdDemoHosTestEnginePoll(void);
-static void osdDemoPaintHosTest(void);
-static void osdDemoRasterWaitUntil(uint32_t deadlineTicks);
-static void osdDemoPaintRaster(void);
+static void osdDemoTwisterEnginePoll(void);
+static void osdDemoPaintTwister(void);
+static void osdDemoWaitCycles(uint32_t deadlineTicks);
+static void osdDemoMgResetStats(void);
+static void osdDemoMgTrackLinePeriod(uint32_t edgeTicks, uint32_t nominalLineTicks);
+static inline int32_t osdDemoMgLineOffset(uint16_t line, uint32_t lineQ16);
+static bool osdDemoMgWriteRow(uint8_t row, const uint8_t *glyphs, uint8_t winL, uint8_t winR,
+                              uint32_t finishBy, bool checkDeadline, bool maskIrq);
+static bool osdDemoMgWriteRowChase(uint8_t row, const uint8_t *glyphs, uint8_t cols,
+                                   uint32_t hsyncPrev, uint32_t lineTicks);
+static void osdDemoMgHsyncMeasure(uint8_t row, uint32_t pivot, uint32_t lineQ16, int32_t *ref,
+                                  bool *haveRef);
+static uint32_t osdDemoMgHsyncAt(uint16_t line, uint32_t pivot, uint32_t lineQ16);
+static void osdDemoMgMeasureFieldPhase(uint32_t vsyncEdge, uint32_t row0, uint32_t lineTicks);
 
 // Drain SPI after the CPU shadow is ready. waitVsync=true: wait then flush
 // (EnterFx / post-paint). Never put heavy paint BETWEEN vsync and flush —
 // tunnel math alone burns blanking and the beam tears the text band.
 static void osdDemoSyncFlush(bool waitVsync, bool applyHosEarly)
 {
-#ifdef USE_CHIPTUNE
-    beeperPwmAyFifoFill();
-#endif
     if (waitVsync) {
-        (void)max7456WaitVsyncFallingEdge(NULL, OSD_DEMO_RASTER_VSYNC_TIMEOUT_US);
+        (void)max7456WaitVsyncFallingEdge(NULL, OSD_DEMO_PAL_VSYNC_TIMEOUT_US);
     }
     if (applyHosEarly && !hosWrappedThisStep) {
         max7456ApplyHudMotionNow();
     }
     while (max7456DrawScreen()) {
-#ifdef USE_CHIPTUNE
-        beeperPwmAyFifoFill();
-#endif
-    }
-#ifdef USE_CHIPTUNE
-    beeperPwmAyFifoFill();
-#endif
-}
-static void osdDemoRasterEngineInit(void);
-static void osdDemoRasterEnginePoll(void);
-static void osdDemoRasterWriteA(void);
-static void osdDemoRasterWriteB(void);
-static void osdDemoPaintRasterCal(void);
-static void osdDemoRasterCalReset(void);
-static void osdDemoRasterCalCatch(void);
-static void osdDemoRasterCalCommit(void);
-static void osdDemoRasterCalAdvanceSweep(void);
-static void osdDemoRasterMarkSetCell(uint8_t glyph);
-static void osdDemoRasterMarkOnEvent(uint32_t eventIndex, uint32_t eventTick, uint32_t lateTicks);
-
-static uint32_t osdDemoRasterEffectivePeriodTicks(void)
-{
-    return (uint32_t)((int32_t)OSD_DEMO_RASTER_NOMINAL_PERIOD_TICKS + periodCorrectionTicks);
-}
-
-static void osdDemoRasterClampPeriodCorrection(void)
-{
-    const int32_t maxc = (int32_t)clockMicrosToCycles(OSD_DEMO_RASTER_CORR_MAX_US);
-    if (periodCorrectionTicks > maxc) {
-        periodCorrectionTicks = maxc;
-    } else if (periodCorrectionTicks < -maxc) {
-        periodCorrectionTicks = -maxc;
-    }
-}
-
-static void osdDemoRasterClampPhaseToPeriod(void)
-{
-    const uint32_t period = osdDemoRasterEffectivePeriodTicks();
-    if (rasterPhaseTicks >= period) {
-        rasterPhaseTicks = period - 1;
     }
 }
 
@@ -731,7 +754,7 @@ static void osdDemoAdvanceHosAndStars(void)
 {
     hosSteps = osdDemoHosSteps();
     hosWrappedThisStep = false;
-    if (fx == OSD_DEMO_FX_RASTER || fx == OSD_DEMO_FX_HOSTEST) {
+    if (fx == OSD_DEMO_FX_TWISTER) {
         max7456SetHudMotionOffset(0, 0);
         return;
     }
@@ -814,9 +837,6 @@ static void osdDemoSnapshotToFire(uint8_t cols, uint8_t rows)
     const uint8_t yDiv = (plasmaH > 1) ? (uint8_t)(plasmaH - 1) : 1;
 
     for (uint8_t y = plasmaY0; y < plasmaY1; y++) {
-#ifdef USE_CHIPTUNE
-        beeperPwmAyFifoFill();
-#endif
         const uint8_t local = (uint8_t)(y - plasmaY0);
         const int8_t cy = (int8_t)(((uint16_t)local * 31u) / yDiv);
         for (uint8_t x = 0; x < cols; x++) {
@@ -1824,9 +1844,6 @@ static void osdDemoPaintTunnel(void)
         : 0;
 
     for (uint8_t cellY = 0; cellY < rows; cellY++) {
-#ifdef USE_CHIPTUNE
-        beeperPwmAyFifoFill();
-#endif
         for (uint8_t cellX = 0; cellX < cols; cellX++) {
             uint8_t pat = 0;
             for (uint8_t br = 0; br < 3; br++) {
@@ -1887,12 +1904,6 @@ static void osdDemoPaintTunnel(void)
     }
 }
 
-// --- Fast 2×1 hatch renderer (F7/FD full-cell diagonal) ----------------
-
-static uint8_t osdDemoHatch2x1Glyph(uint8_t row)
-{
-    return (row & 1u) ? (uint8_t)OSD_DEMO_FILL_GLYPH_P1 : (uint8_t)OSD_DEMO_FILL_GLYPH_P0;
-}
 
 // Row-burst Display SRAM fill — much fewer SPI transactions than per-cell WriteChar.
 static void osdDemoFillRowsGlyphFast(uint8_t cols, uint8_t rows, uint8_t glyphEven, uint8_t glyphOdd)
@@ -1910,27 +1921,6 @@ static void osdDemoFillRowsGlyphFast(uint8_t cols, uint8_t rows, uint8_t glyphEv
     }
 }
 
-static void osdDemoPaintHatch2x1Screen(uint8_t cols, uint8_t rows, bool cornerFiducials)
-{
-    if (cols == 0 || rows == 0) {
-        return;
-    }
-    if (cols > OSD_DEMO_CHARS_PER_LINE) {
-        cols = OSD_DEMO_CHARS_PER_LINE;
-    }
-    for (uint8_t y = 0; y < rows; y++) {
-        const uint16_t addr = (uint16_t)((uint16_t)y * (uint16_t)OSD_DEMO_CHARS_PER_LINE);
-        (void)max7456WriteDisplaySramRowFillEx(addr, osdDemoHatch2x1Glyph(y), cols, true);
-    }
-    if (cornerFiducials) {
-        const uint8_t xr = (uint8_t)(cols - 1);
-        const uint8_t yb = (uint8_t)(rows - 1);
-        max7456WriteChar(0, 0, OSD_DEMO_FILL_BASE);
-        max7456WriteChar(xr, 0, OSD_DEMO_FILL_BASE);
-        max7456WriteChar(0, yb, OSD_DEMO_FILL_BASE);
-        max7456WriteChar(xr, yb, OSD_DEMO_FILL_BASE);
-    }
-}
 
 // Scene 7 — mid-glyph 2×2 plasma:
 // Solid PX22 (all 18 rows) → both lines of each band lit. Early-odd SPI + prefetch
@@ -1938,7 +1928,7 @@ static void osdDemoPaintHatch2x1Screen(uint8_t cols, uint8_t rows, bool cornerFi
 
 static int8_t plasmaSx[OSD_DEMO_CHECKER_COLS * OSD_DEMO_CHECKER_CELL_W2];
 static int8_t plasmaSy[OSD_DEMO_CHECKER_ROWS * OSD_DEMO_PLASMA2X2_BANDS];
-static int8_t plasmaSd[256];
+static int8_t plasmaSd[512]; // second half mirrors the first: index my+mx without & 255
 
 static void osdDemoPlasma2x2BuildLuts(uint8_t cols, uint8_t rows, uint8_t t)
 {
@@ -1952,46 +1942,39 @@ static void osdDemoPlasma2x2BuildLuts(uint8_t cols, uint8_t rows, uint8_t t)
     }
     for (uint16_t i = 0; i < 256u; i++) {
         plasmaSd[i] = osdDemoSineAt((uint8_t)(i * OSD_DEMO_PLASMA2X2_KD + t));
+        plasmaSd[i + 256u] = plasmaSd[i];
     }
 }
 
+// v = Sx + Sy + Sd ∈ [−384, 381] (three int8 sines) → s = v + 384 ∈ [0, 765]: the old
+// 0..767 clamp never fired, and (s·ZEBRA) >> 9 with ZEBRA = 8 is s >> 6. Sd is mirrored to
+// 512 entries so the diagonal index needs no wrap. Same masks, ~half the inner-loop work.
+#if OSD_DEMO_PLASMA_ZEBRA_BANDS != 8
+#error "osdDemoPlasma2x2BuildMasks assumes 8 zebra bands (s >> 6)"
+#endif
 static void osdDemoPlasma2x2BuildMasks(uint8_t y, uint8_t b,
                                        uint8_t cols, uint8_t *glyphs, uint8_t *packs)
 {
     const uint16_t my = (uint16_t)y * OSD_DEMO_PLASMA2X2_BANDS + b;
+    const int16_t base = (int16_t)plasmaSy[my] + 384;
+    const int8_t *sx = plasmaSx;
+    const int8_t *sd = &plasmaSd[my & 0xFFu];
     for (uint8_t x = 0; x < cols; x++) {
         uint8_t pat = 0;
-        const uint16_t x0 = (uint16_t)x * OSD_DEMO_CHECKER_CELL_W2;
         for (uint8_t bc = 0; bc < OSD_DEMO_CHECKER_CELL_W2; bc++) {
-            const uint16_t mx = x0 + bc;
-            int16_t v = (int16_t)plasmaSx[mx] + (int16_t)plasmaSy[my]
-                + (int16_t)plasmaSd[(uint8_t)(mx + my)];
-            int16_t s = (int16_t)(v + 384);
-            if (s < 0) {
-                s = 0;
-            }
-            if (s > 767) {
-                s = 767;
-            }
-            if (((((uint16_t)s * OSD_DEMO_PLASMA_ZEBRA_BANDS) >> 9) & 1u) != 0u) {
-                pat |= (uint8_t)(1u << bc);
-            }
+            const int16_t s6 = (int16_t)(base + (int16_t)sx[bc] + (int16_t)sd[bc]);
+            pat |= (uint8_t)((((uint16_t)s6 >> 6) & 1u) << bc);
         }
+        sx += OSD_DEMO_CHECKER_CELL_W2;
+        sd += OSD_DEMO_CHECKER_CELL_W2;
         glyphs[x] = (uint8_t)(OSD_DEMO_PX22_BASE + pat);
         packs[x] = pat;
     }
 }
 
-static void osdDemoPlasma2x2WriteRow(uint16_t addr, const uint8_t *glyphs,
-                                     const uint8_t *packs, uint8_t cols)
-{
-    if (memcmp(plasmaPrevPack, packs, cols) == 0) {
-        return;
-    }
-    (void)max7456WriteDisplaySramRowGlyphs(addr, glyphs, cols, false);
-    memcpy(plasmaPrevPack, packs, cols);
-}
-
+// Scene 7 engine. Same video model as scene 8 (measured line period, HSYNC re-lock per char
+// row, SRAM mirror + dirty runs) but writes race the beam: ~half of the 30 cells change per
+// band (~54 B), which can never finish inside the previous line, but always fits behind it.
 static void osdDemoPlasma2x2EnginePoll(void)
 {
     if (!plasma2x2Armed || !demoDisplay) {
@@ -2010,26 +1993,33 @@ static void osdDemoPlasma2x2EnginePoll(void)
         rows = OSD_DEMO_CHECKER_ROWS;
     }
 
-    const uint32_t burstTicks = clockMicrosToCycles(OSD_DEMO_PLASMA2X2_BURST_US);
-    const uint32_t padTicks = clockMicrosToCycles(OSD_DEMO_PLASMA2X2_ODD_PAD_US);
-    const uint32_t lineTicks = clockMicrosToCycles(rasterLineUs ? rasterLineUs : OSD_DEMO_RASTER_LINE_US_DEFAULT);
-    const uint32_t row0Us = OSD_DEMO_RASTER_VBLANK_US;
+    const uint32_t nominalLineTicks = clockMicrosToCycles(OSD_DEMO_PAL_LINE_US);
+    const uint32_t pivotTicks = clockMicrosToCycles(OSD_DEMO_PAL_VBLANK_US
+        + OSD_DEMO_MG_PIVOT_LINE * OSD_DEMO_PAL_LINE_US);
+    const uint32_t prefetchLead = clockMicrosToCycles(OSD_DEMO_PLASMA2X2_PREFETCH_US);
+    if (mgBurstFixedTicks == 0) {
+        mgBurstFixedTicks = clockMicrosToCycles(OSD_DEMO_MG_BURST_FIXED_US);
+    }
+    if (mgByteTicksQ8 == 0) {
+        mgByteTicksQ8 = (clockMicrosToCycles(30) << 8) / 36u;
+    }
 
     uint8_t glyphs[2][OSD_DEMO_CHECKER_COLS];
-    uint8_t packs[2][OSD_DEMO_CHECKER_COLS];
+    uint8_t packs[OSD_DEMO_CHECKER_COLS];
 
     max7456MidGlyphSpiBegin();
 
     uint8_t vsyncFails = 0;
     while (active && plasma2x2Armed && !ARMING_FLAG(ARMED)) {
-        if ((millis() - fxStartMs) >= OSD_DEMO_FX_PLASMA2X2_MS) {
+        if (!fxHold && (millis() - fxStartMs) >= OSD_DEMO_FX_PLASMA2X2_MS) {
             plasma2x2Armed = false;
             break;
         }
 
         uint32_t edgeTicks = 0;
         max7456MidGlyphSpiBoost(false);
-        if (!max7456WaitVsyncFallingEdge(&edgeTicks, OSD_DEMO_RASTER_VSYNC_TIMEOUT_US)) {
+        if (!max7456WaitVsyncFallingEdge(&edgeTicks, OSD_DEMO_PAL_VSYNC_TIMEOUT_US)) {
+            mgLastEdgeTicks = 0;
             if (++vsyncFails >= 8) {
                 plasma2x2Armed = false;
                 break;
@@ -2042,68 +2032,82 @@ static void osdDemoPlasma2x2EnginePoll(void)
             continue;
         }
         vsyncFails = 0;
+        mgStatFields++;
 
-        const uint32_t row0 = edgeTicks + clockMicrosToCycles(row0Us);
-        if (++plasmaPhaseDiv >= 2u) {
-            plasmaPhaseDiv = 0;
+        osdDemoMgTrackLinePeriod(edgeTicks, nominalLineTicks);
+        const uint32_t lineQ16 = mgLineQ16;
+        const uint32_t lineTicks = lineQ16 >> 16;
+        const uint32_t pivot = edgeTicks + pivotTicks
+            + (uint32_t)(int32_t)((int32_t)mgShiftUs * (int32_t)clockMicrosToCycles(1));
+        // First lit line from the same measured model as every band (not VSYNC + 1504 us:
+        // with a 65.4 us line that is ~200 us = 3 lines too late, and the VBLANK preload
+        // then ran into row 0 and made its band 1 miss the beam).
+        const uint32_t row0 = pivot + (uint32_t)osdDemoMgLineOffset(0, lineQ16);
+        osdDemoMgMeasureFieldPhase(edgeTicks, row0, lineTicks);
+
+        // One phase step per frame, on the field that starts it, so both woven fields carry
+        // the same plasma (twpair 1 flips the guess, twpair off = old free-running ÷2).
+        if (twisterPairParity == OSD_DEMO_TWISTER_PAIR_OFF) {
+            if (++plasmaPhaseDiv >= 2u) {
+                plasmaPhaseDiv = 0;
+                plasmaPhase++;
+            }
+        } else if (mgFieldFirst == (twisterPairParity == 0u)) {
             plasmaPhase++;
         }
         osdDemoPlasma2x2BuildLuts(cols, rows, plasmaPhase);
 
         max7456MidGlyphSpiBoost(true);
-        const uint32_t blankDeadline = row0 - burstTicks;
 
+        // VBLANK preload of band 0 for as many rows as fit before the first lit line.
+        const uint32_t fullRowTicks = mgBurstFixedTicks
+            + (((10u + 2u * (uint32_t)cols) * mgByteTicksQ8) >> 8); // worst case: one AI run
+        const uint32_t blankDeadline = row0 - fullRowTicks;
         uint8_t yPre = 0;
         for (; yPre < rows; yPre++) {
             if ((int32_t)(getCycleCounter() - blankDeadline) > 0) {
                 break;
             }
-            osdDemoPlasma2x2BuildMasks(yPre, 0, cols, glyphs[0], packs[0]);
-            const uint16_t addr = (uint16_t)((uint16_t)yPre * (uint16_t)OSD_DEMO_CHARS_PER_LINE);
-            memset(plasmaPrevPack, 0xFF, cols);
-            osdDemoPlasma2x2WriteRow(addr, glyphs[0], packs[0], cols);
+            osdDemoPlasma2x2BuildMasks(yPre, 0, cols, glyphs[0], packs);
+            (void)osdDemoMgWriteRow(yPre, glyphs[0], 0, cols, 0, false, false);
         }
 
+        int32_t hsyncRef = 0;
+        bool hsyncHaveRef = false;
+
         for (uint8_t y = 0; y < rows; y++) {
-            const uint16_t addr = (uint16_t)((uint16_t)y * (uint16_t)OSD_DEMO_CHARS_PER_LINE);
-            memset(plasmaPrevPack, 0xFF, cols);
             const uint8_t b0 = (y < yPre) ? 1u : 0u;
-            if (b0 >= OSD_DEMO_PLASMA2X2_BANDS) {
-                continue;
+            // 3 write-free lines before a preloaded row: re-lock to the real HSYNC.
+            if (y < yPre && mgHsyncLock) {
+                osdDemoMgHsyncMeasure(y, pivot, lineQ16, &hsyncRef, &hsyncHaveRef);
             }
 
             uint8_t cur = 0;
-            osdDemoPlasma2x2BuildMasks(y, b0, cols, glyphs[cur], packs[cur]);
+            osdDemoPlasma2x2BuildMasks(y, b0, cols, glyphs[cur], packs);
 
             for (uint8_t b = b0; b < OSD_DEMO_PLASMA2X2_BANDS; b++) {
-                const uint8_t py = (uint8_t)(b * OSD_DEMO_PLASMA2X2_STEP);
-                const uint32_t due = row0
-                    + ((uint32_t)y * (uint32_t)OSD_DEMO_CHECKER_CELL_H + (uint32_t)py) * lineTicks;
-                uint32_t wrAt = due - lineTicks + padTicks;
-                const uint32_t finishBy = due - padTicks;
-                if ((int32_t)(wrAt - edgeTicks) < 0) {
-                    wrAt = edgeTicks;
-                }
+                const uint16_t dueLine = (uint16_t)((uint16_t)y * OSD_DEMO_CHECKER_CELL_H
+                                                    + (uint16_t)b * OSD_DEMO_PLASMA2X2_STEP);
+                const uint32_t hsyncPrev = osdDemoMgHsyncAt((uint16_t)(dueLine - 1u), pivot, lineQ16);
+                const bool hasNext = (uint8_t)(b + 1u) < OSD_DEMO_PLASMA2X2_BANDS;
 
+                // Build the next band while the beam is still ahead of us.
                 bool nextBuilt = false;
-                if ((int32_t)(getCycleCounter() - wrAt) < 0) {
-                    if ((uint8_t)(b + 1u) < OSD_DEMO_PLASMA2X2_BANDS) {
-                        osdDemoPlasma2x2BuildMasks(y, (uint8_t)(b + 1u), cols,
-                                                   glyphs[cur ^ 1u], packs[cur ^ 1u]);
-                        nextBuilt = true;
+                if (hasNext && (int32_t)(hsyncPrev - prefetchLead - getCycleCounter()) > 0) {
+                    osdDemoPlasma2x2BuildMasks(y, (uint8_t)(b + 1u), cols, glyphs[cur ^ 1u], packs);
+                    nextBuilt = true;
+                }
+
+                if (!osdDemoMgWriteRowChase(y, glyphs[cur], cols, hsyncPrev, lineTicks)) {
+                    mgStatSkips++;
+                    if (y < OSD_DEMO_MG_ROWS_MAX && mgStatSkipRow[y] < UINT16_MAX) {
+                        mgStatSkipRow[y]++;
                     }
-                    osdDemoRasterWaitUntil(wrAt);
                 }
 
-                const uint32_t tWrite = getCycleCounter();
-                if ((int32_t)(finishBy - tWrite) >= (int32_t)burstTicks) {
-                    osdDemoPlasma2x2WriteRow(addr, glyphs[cur], packs[cur], cols);
-                }
-
-                if ((uint8_t)(b + 1u) < OSD_DEMO_PLASMA2X2_BANDS) {
+                if (hasNext) {
                     if (!nextBuilt) {
-                        osdDemoPlasma2x2BuildMasks(y, (uint8_t)(b + 1u), cols,
-                                                   glyphs[cur ^ 1u], packs[cur ^ 1u]);
+                        osdDemoPlasma2x2BuildMasks(y, (uint8_t)(b + 1u), cols, glyphs[cur ^ 1u], packs);
                     }
                     cur ^= 1u;
                 }
@@ -2121,61 +2125,974 @@ static void osdDemoPlasma2x2EnginePoll(void)
     max7456MidGlyphSpiEnd();
 }
 
-// Mid-scanline HOS probe (display timing only — no Display SRAM rewrite after paint):
-//   full-height white bar + corner fiducials
-//   repeating 4-field cycle:
-//     0: hold HOS=A all field     — bar LEFT  (proves write + latch)
-//     1: hold HOS=B all field     — bar RIGHT (should jump every other field)
-//     2/3: A at VSYNC, B at mid of hosTestLine — look for mid-line kink
-// Readout:
-//   - bar jumps L↔R every field on 0/1     → HOS writes work (field or faster)
-//   - kink mid-line on phase 2/3           → HOS is realtime
-//   - shift from next line only on 2/3     → line-latch
-//   - phase 2/3 looks identical to hold-B  → field-latch (mid poke too late for this field)
-static void osdDemoPaintHosTest(void)
+
+// ---------------------------------------------------------------------------
+// 6px logical-block edge glyphs (1 physical px phases). Preloaded at InstallFont.
+// INV supplies reverse directions — no second inverted glyph bank.
+// ---------------------------------------------------------------------------
+
+// Scene 8 — classic vertical twister (rotating square cross-section).
+// 4 projected edges → front-facing intervals; widths from geometry, not cells.
+// Paint faces into a per-px color buffer, then encode cells so WHITE↔DITHER
+// shares a 1px phase (WD/DW) instead of the second face clobbering the first.
+
+enum {
+    OSD_DEMO_TWISTER_PIX_BLACK = 0, // 00
+    OSD_DEMO_TWISTER_PIX_WHITE = 2, // 10
+};
+
+// One checker for every dither glyph (D/DT/WD/DW/full-D). Phase matches plasma 0xEE /
+// EDGE_BD: top-left (0,0) = WHITE. Even cell width → seamless across character joins.
+static uint8_t osdDemoTwisterDitherPix(uint8_t x, uint8_t row)
+{
+    return (((x ^ row) & 1u) == 0u) ? (uint8_t)OSD_DEMO_TWISTER_PIX_WHITE
+                                    : (uint8_t)OSD_DEMO_TWISTER_PIX_BLACK;
+}
+
+static void osdDemoTwisterPackRow(uint8_t *dst3, const uint8_t pix12[12])
+{
+    for (uint8_t b = 0; b < 3; b++) {
+        uint8_t v = 0;
+        for (uint8_t i = 0; i < 4; i++) {
+            v = (uint8_t)((v << 2) | (pix12[b * 4u + i] & 3u));
+        }
+        dst3[b] = v;
+    }
+}
+
+static void osdDemoTwisterBuildXFillWhite(uint8_t *nvm54, uint8_t leftWhitePx)
+{
+    uint8_t pix[12];
+    for (uint8_t row = 0; row < OSD_DEMO_CELL_H; row++) {
+        for (uint8_t x = 0; x < OSD_DEMO_CELL_W; x++) {
+            pix[x] = (x < leftWhitePx) ? (uint8_t)OSD_DEMO_TWISTER_PIX_WHITE
+                                       : (uint8_t)OSD_DEMO_TWISTER_PIX_BLACK;
+        }
+        osdDemoTwisterPackRow(&nvm54[(uint16_t)row * 3u], pix);
+    }
+}
+
+static void osdDemoTwisterBuildXFillDitherLeft(uint8_t *nvm54, uint8_t leftDitherPx)
+{
+    uint8_t pix[12];
+    for (uint8_t row = 0; row < OSD_DEMO_CELL_H; row++) {
+        for (uint8_t x = 0; x < OSD_DEMO_CELL_W; x++) {
+            if (x >= leftDitherPx) {
+                pix[x] = (uint8_t)OSD_DEMO_TWISTER_PIX_BLACK;
+            } else {
+                pix[x] = osdDemoTwisterDitherPix(x, row);
+            }
+        }
+        osdDemoTwisterPackRow(&nvm54[(uint16_t)row * 3u], pix);
+    }
+}
+
+static void osdDemoTwisterBuildXFillDitherTail(uint8_t *nvm54, uint8_t leftBlackPx)
+{
+    uint8_t pix[12];
+    for (uint8_t row = 0; row < OSD_DEMO_CELL_H; row++) {
+        for (uint8_t x = 0; x < OSD_DEMO_CELL_W; x++) {
+            if (x < leftBlackPx) {
+                pix[x] = (uint8_t)OSD_DEMO_TWISTER_PIX_BLACK;
+            } else {
+                pix[x] = osdDemoTwisterDitherPix(x, row);
+            }
+        }
+        osdDemoTwisterPackRow(&nvm54[(uint16_t)row * 3u], pix);
+    }
+}
+
+static void osdDemoTwisterBuildXFillWhiteDither(uint8_t *nvm54, uint8_t leftWhitePx)
+{
+    uint8_t pix[12];
+    for (uint8_t row = 0; row < OSD_DEMO_CELL_H; row++) {
+        for (uint8_t x = 0; x < OSD_DEMO_CELL_W; x++) {
+            if (x < leftWhitePx) {
+                pix[x] = (uint8_t)OSD_DEMO_TWISTER_PIX_WHITE;
+            } else {
+                pix[x] = osdDemoTwisterDitherPix(x, row);
+            }
+        }
+        osdDemoTwisterPackRow(&nvm54[(uint16_t)row * 3u], pix);
+    }
+}
+
+static void osdDemoTwisterBuildXFillDitherWhite(uint8_t *nvm54, uint8_t leftDitherPx)
+{
+    uint8_t pix[12];
+    for (uint8_t row = 0; row < OSD_DEMO_CELL_H; row++) {
+        for (uint8_t x = 0; x < OSD_DEMO_CELL_W; x++) {
+            if (x < leftDitherPx) {
+                pix[x] = osdDemoTwisterDitherPix(x, row);
+            } else {
+                pix[x] = (uint8_t)OSD_DEMO_TWISTER_PIX_WHITE;
+            }
+        }
+        osdDemoTwisterPackRow(&nvm54[(uint16_t)row * 3u], pix);
+    }
+}
+
+static void osdDemoTwisterBuildXFillBlackWhite(uint8_t *nvm54, uint8_t leftBlackPx)
+{
+    uint8_t pix[12];
+    for (uint8_t row = 0; row < OSD_DEMO_CELL_H; row++) {
+        for (uint8_t x = 0; x < OSD_DEMO_CELL_W; x++) {
+            pix[x] = (x < leftBlackPx) ? (uint8_t)OSD_DEMO_TWISTER_PIX_BLACK
+                                       : (uint8_t)OSD_DEMO_TWISTER_PIX_WHITE;
+        }
+        osdDemoTwisterPackRow(&nvm54[(uint16_t)row * 3u], pix);
+    }
+}
+
+// One-time NVM install (EnterFx only — never during animation).
+// PX22 0x40..0x7F; no INV glyphs — WT covers black|white. Leaves HFILL @ 0x80.
+static void osdDemoTwisterInstallXFillGlyphs(void)
+{
+    uint8_t nvm[OSD_DEMO_GLYPH_BYTES];
+    for (uint8_t k = 1; k < OSD_DEMO_CELL_W; k++) {
+        const uint8_t idx = (uint8_t)(k - 1u);
+        osdDemoTwisterBuildXFillWhite(nvm, k);
+        (void)max7456WriteNvm((uint8_t)(OSD_DEMO_TWISTER_XFILL_W_BASE + idx), nvm);
+        osdDemoTwisterBuildXFillDitherLeft(nvm, k);
+        (void)max7456WriteNvm((uint8_t)(OSD_DEMO_TWISTER_XFILL_D_BASE + idx), nvm);
+        osdDemoTwisterBuildXFillDitherTail(nvm, k);
+        (void)max7456WriteNvm((uint8_t)(OSD_DEMO_TWISTER_XFILL_DT_BASE + idx), nvm);
+        osdDemoTwisterBuildXFillBlackWhite(nvm, k);
+        (void)max7456WriteNvm((uint8_t)(OSD_DEMO_TWISTER_XFILL_WT_BASE + idx), nvm);
+        osdDemoTwisterBuildXFillWhiteDither(nvm, k);
+        (void)max7456WriteNvm((uint8_t)(OSD_DEMO_TWISTER_XFILL_WD_BASE + idx), nvm);
+        if (k <= OSD_DEMO_TWISTER_XFILL_DW_MAX_K) {
+            osdDemoTwisterBuildXFillDitherWhite(nvm, k);
+            (void)max7456WriteNvm((uint8_t)(OSD_DEMO_TWISTER_XFILL_DW_BASE + idx), nvm);
+        }
+    }
+    max7456EndFontWrite();
+}
+
+static void osdDemoTwisterSolidGlyph(uint8_t color, uint8_t *glyph, uint8_t *inv)
+{
+    *inv = 0;
+    if (color == OSD_DEMO_TWISTER_C_W) {
+        *glyph = OSD_DEMO_TWISTER_GLYPH_W;
+    } else if (color == OSD_DEMO_TWISTER_C_D) {
+        *glyph = OSD_DEMO_TWISTER_GLYPH_D;
+    } else {
+        *glyph = OSD_DEMO_TWISTER_GLYPH_B;
+    }
+}
+
+// Encode a clean 2-run cell [0,t)=c0, [t,12)=c1. Never sets INV (single SPI AI run).
+static void osdDemoTwisterEncodeTwoRun(uint8_t c0, uint8_t c1, uint8_t t,
+                                       uint8_t *glyph, uint8_t *inv)
+{
+    *inv = 0;
+    if (t == 0) {
+        osdDemoTwisterSolidGlyph(c1, glyph, inv);
+        return;
+    }
+    if (t >= OSD_DEMO_CELL_W) {
+        osdDemoTwisterSolidGlyph(c0, glyph, inv);
+        return;
+    }
+
+    const uint8_t idx = (uint8_t)(t - 1u);
+    if (c0 == OSD_DEMO_TWISTER_C_W && c1 == OSD_DEMO_TWISTER_C_B) {
+        *glyph = (uint8_t)(OSD_DEMO_TWISTER_XFILL_W_BASE + idx);
+        return;
+    }
+    if (c0 == OSD_DEMO_TWISTER_C_B && c1 == OSD_DEMO_TWISTER_C_W) {
+        *glyph = (uint8_t)(OSD_DEMO_TWISTER_XFILL_WT_BASE + idx);
+        return;
+    }
+    if (c0 == OSD_DEMO_TWISTER_C_D && c1 == OSD_DEMO_TWISTER_C_B) {
+        *glyph = (uint8_t)(OSD_DEMO_TWISTER_XFILL_D_BASE + idx);
+        return;
+    }
+    if (c0 == OSD_DEMO_TWISTER_C_B && c1 == OSD_DEMO_TWISTER_C_D) {
+        *glyph = (uint8_t)(OSD_DEMO_TWISTER_XFILL_DT_BASE + idx);
+        return;
+    }
+    if (c0 == OSD_DEMO_TWISTER_C_W && c1 == OSD_DEMO_TWISTER_C_D) {
+        *glyph = (uint8_t)(OSD_DEMO_TWISTER_XFILL_WD_BASE + idx);
+        return;
+    }
+    if (c0 == OSD_DEMO_TWISTER_C_D && c1 == OSD_DEMO_TWISTER_C_W) {
+        // DW bank only has k=1..9. For t=10..11 under-draw to solid D — never clamp
+        // down to k=9 (that over-draws white and flashes a wider face).
+        if (t > OSD_DEMO_TWISTER_XFILL_DW_MAX_K) {
+            osdDemoTwisterSolidGlyph(OSD_DEMO_TWISTER_C_D, glyph, inv);
+            return;
+        }
+        *glyph = (uint8_t)(OSD_DEMO_TWISTER_XFILL_DW_BASE + idx);
+        return;
+    }
+    osdDemoTwisterSolidGlyph(c0, glyph, inv);
+}
+
+// Classify one 12px cell. Extreme X (thin faces / 3+ runs) must NEVER expand a color
+// past its true span — that picks a wider XFILL and flashes a fat ribbon.
+static void osdDemoTwisterEncodeCell(const uint8_t pix[12], uint8_t *glyph, uint8_t *inv)
+{
+    *inv = 0;
+
+    uint8_t runC[4];
+    uint8_t runS[5];
+    uint8_t n = 1;
+    runS[0] = 0;
+    runC[0] = pix[0];
+    for (uint8_t i = 1; i < OSD_DEMO_CELL_W; i++) {
+        if (pix[i] != runC[n - 1u]) {
+            if (n >= 4u) {
+                break;
+            }
+            runS[n] = i;
+            runC[n] = pix[i];
+            n++;
+        }
+    }
+    runS[n] = OSD_DEMO_CELL_W;
+
+    if (n == 1u) {
+        osdDemoTwisterSolidGlyph(runC[0], glyph, inv);
+        return;
+    }
+    if (n == 2u) {
+        osdDemoTwisterEncodeTwoRun(runC[0], runC[1], runS[1], glyph, inv);
+        return;
+    }
+
+    const uint8_t leftC = pix[0];
+    const uint8_t rightC = pix[OSD_DEMO_CELL_W - 1u];
+
+    // B|C|B islands: snap to nearest cell edge when close (smooth ribbon), else suppress.
+    // Never use B|C-to-end — that flashes a full-cell-wide square.
+    if (leftC == OSD_DEMO_TWISTER_C_B && rightC == OSD_DEMO_TWISTER_C_B) {
+        if (n >= 3u && runC[1] != OSD_DEMO_TWISTER_C_B) {
+            const uint8_t a = runS[1];
+            const uint8_t b = runS[2];
+            const uint8_t midC = runC[1];
+            if (a <= 2u) {
+                // Near left: C|B ending at b (at most +2px left expand).
+                osdDemoTwisterEncodeTwoRun(midC, OSD_DEMO_TWISTER_C_B, b, glyph, inv);
+                return;
+            }
+            if (b >= (uint8_t)(OSD_DEMO_CELL_W - 2u)) {
+                // Near right: B|C starting at a (at most +2px right expand).
+                osdDemoTwisterEncodeTwoRun(OSD_DEMO_TWISTER_C_B, midC, a, glyph, inv);
+                return;
+            }
+        }
+        osdDemoTwisterSolidGlyph(OSD_DEMO_TWISTER_C_B, glyph, inv);
+        return;
+    }
+
+    // Silhouette edge + face edge in one cell (B|W|D, B|D|W, W|D|B, D|W|B — 0.5% of cells).
+    // No 3-run glyphs exist, so keep the SILHOUETTE edge exact and paint the ribbon part with
+    // whichever face covers more of it. The old rule kept the face edge and blacked out the
+    // middle face — a black notch "cutting" the ribbon at every B/W/D junction.
+    if (leftC == OSD_DEMO_TWISTER_C_B || rightC == OSD_DEMO_TWISTER_C_B) {
+        uint8_t a = 0;
+        uint8_t b = OSD_DEMO_CELL_W;
+        if (leftC == OSD_DEMO_TWISTER_C_B) {
+            while (a < OSD_DEMO_CELL_W && pix[a] == OSD_DEMO_TWISTER_C_B) {
+                a++;
+            }
+        } else {
+            while (b > 0u && pix[b - 1u] == OSD_DEMO_TWISTER_C_B) {
+                b--;
+            }
+        }
+        uint8_t nW = 0;
+        uint8_t nD = 0;
+        bool solidRibbon = true;
+        for (uint8_t i = a; i < b; i++) {
+            if (pix[i] == OSD_DEMO_TWISTER_C_W) {
+                nW++;
+            } else if (pix[i] == OSD_DEMO_TWISTER_C_D) {
+                nD++;
+            } else {
+                solidRibbon = false; // inner black seam: leave it to the rules below
+            }
+        }
+        if (solidRibbon && a < b) {
+            const uint8_t face = (nW >= nD) ? OSD_DEMO_TWISTER_C_W : OSD_DEMO_TWISTER_C_D;
+            if (leftC == OSD_DEMO_TWISTER_C_B) {
+                osdDemoTwisterEncodeTwoRun(OSD_DEMO_TWISTER_C_B, face, a, glyph, inv);
+            } else {
+                osdDemoTwisterEncodeTwoRun(face, OSD_DEMO_TWISTER_C_B, b, glyph, inv);
+            }
+            return;
+        }
+    }
+
+    // B|…|R where R is a pure suffix: encode B|R at suffix start (left under-drawn).
+    if (leftC == OSD_DEMO_TWISTER_C_B) {
+        uint8_t t = OSD_DEMO_CELL_W;
+        while (t > 0u && pix[t - 1u] == rightC) {
+            t--;
+        }
+        osdDemoTwisterEncodeTwoRun(OSD_DEMO_TWISTER_C_B, rightC, t, glyph, inv);
+        return;
+    }
+
+    // L|…|B where L is a pure prefix: encode L|B (right under-drawn).
+    if (rightC == OSD_DEMO_TWISTER_C_B) {
+        uint8_t t = 0;
+        while (t < OSD_DEMO_CELL_W && pix[t] == leftC) {
+            t++;
+        }
+        osdDemoTwisterEncodeTwoRun(leftC, OSD_DEMO_TWISTER_C_B, t, glyph, inv);
+        return;
+    }
+
+    // Both edges colored (W|B|D, W|D, …). Right color must stay a suffix.
+    {
+        uint8_t tR = OSD_DEMO_CELL_W;
+        while (tR > 0u && pix[tR - 1u] == rightC) {
+            tR--;
+        }
+        uint8_t tL = 0;
+        while (tL < OSD_DEMO_CELL_W && pix[tL] == leftC) {
+            tL++;
+        }
+
+        bool leftPureToJoin = true;
+        for (uint8_t i = 0; i < tR; i++) {
+            if (pix[i] != leftC) {
+                leftPureToJoin = false;
+                break;
+            }
+        }
+        if (leftPureToJoin && leftC != rightC) {
+            osdDemoTwisterEncodeTwoRun(leftC, rightC, tR, glyph, inv);
+            return;
+        }
+
+        // Thin black seam between two faces (W|B|D, ≤2px): absorb into leftC|rightC
+        // so the join stays 1px-smooth instead of a square black notch.
+        if (leftC != rightC && tL < tR) {
+            bool thinBlackSeam = true;
+            for (uint8_t i = tL; i < tR; i++) {
+                if (pix[i] != OSD_DEMO_TWISTER_C_B) {
+                    thinBlackSeam = false;
+                    break;
+                }
+            }
+            if (thinBlackSeam && (uint8_t)(tR - tL) <= 2u) {
+                osdDemoTwisterEncodeTwoRun(leftC, rightC, tR, glyph, inv);
+                return;
+            }
+        }
+
+        // Mixed middle: keep the wider true edge, under-draw the other.
+        const uint8_t leftSpan = tL;
+        const uint8_t rightSpan = (uint8_t)(OSD_DEMO_CELL_W - tR);
+        if (rightSpan >= leftSpan) {
+            osdDemoTwisterEncodeTwoRun(OSD_DEMO_TWISTER_C_B, rightC, tR, glyph, inv);
+        } else {
+            osdDemoTwisterEncodeTwoRun(leftC, OSD_DEMO_TWISTER_C_B, leftSpan, glyph, inv);
+        }
+    }
+}
+
+// Fast scanline: only the silhouette window, no full-width color buffer / INV.
+static void osdDemoTwisterBuildScanline(uint8_t *glyphs, uint8_t cols,
+                                        uint8_t phase, int16_t centerX,
+                                        uint8_t winL, uint8_t winR)
+{
+    if (winR > cols) {
+        winR = cols;
+    }
+    if (winL >= winR) {
+        return;
+    }
+
+    int16_t e[4];
+    for (uint8_t k = 0; k < 4; k++) {
+        const int8_t s = osdDemoSineAt((uint8_t)(phase + (uint8_t)(k * 64u)));
+        e[k] = (int16_t)(centerX + (((int16_t)OSD_DEMO_TWISTER_AMP_PX * (int16_t)s) / 128));
+    }
+
+    int16_t fL[2];
+    int16_t fR[2];
+    uint8_t fC[2];
+    uint8_t nFace = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        const int16_t x0 = e[i];
+        const int16_t x1 = e[(uint8_t)((i + 1u) & 3u)];
+        if (x1 > x0 && nFace < 2u) {
+            fL[nFace] = x0;
+            fR[nFace] = x1;
+            fC[nFace] = ((i & 1u) == 0u) ? OSD_DEMO_TWISTER_C_W : OSD_DEMO_TWISTER_C_D;
+            nFace++;
+        }
+    }
+    // Left-to-right paint order — stable shared edge, no right-face flash over left.
+    if (nFace == 2u && fL[1] < fL[0]) {
+        const int16_t sl = fL[0];
+        const int16_t sr = fR[0];
+        const uint8_t sc = fC[0];
+        fL[0] = fL[1];
+        fR[0] = fR[1];
+        fC[0] = fC[1];
+        fL[1] = sl;
+        fR[1] = sr;
+        fC[1] = sc;
+    }
+
+    for (uint8_t x = winL; x < winR; x++) {
+        const int16_t cell0 = (int16_t)((uint16_t)x * (uint16_t)OSD_DEMO_CELL_W);
+        const int16_t cell1 = (int16_t)(cell0 + (int16_t)OSD_DEMO_CELL_W);
+
+        // Fast path: no face edge strictly inside this cell → the cell is one solid
+        // color (same result as the per-pixel path). Only the ≤4 edge cells per band
+        // pay for the 12px buffer + run encoder, which keeps the build well under the
+        // band period even with audio/USB IRQs stealing time.
+        bool hasEdge = false;
+        uint8_t solid = OSD_DEMO_TWISTER_C_B;
+        for (uint8_t f = 0; f < nFace; f++) {
+            if ((fL[f] > cell0 && fL[f] < cell1) || (fR[f] > cell0 && fR[f] < cell1)) {
+                hasEdge = true;
+                break;
+            }
+            if (fL[f] <= cell0 && fR[f] >= cell1) {
+                solid = fC[f]; // later face wins, as in the paint loop below
+            }
+        }
+        if (!hasEdge) {
+            uint8_t inv = 0;
+            osdDemoTwisterSolidGlyph(solid, &glyphs[x], &inv);
+            continue;
+        }
+
+        uint8_t pix[OSD_DEMO_CELL_W];
+        for (uint8_t p = 0; p < OSD_DEMO_CELL_W; p++) {
+            pix[p] = OSD_DEMO_TWISTER_C_B;
+        }
+        for (uint8_t f = 0; f < nFace; f++) {
+            int16_t a = (int16_t)(fL[f] - cell0);
+            int16_t b = (int16_t)(fR[f] - cell0);
+            if (a < 0) {
+                a = 0;
+            }
+            if (b > (int16_t)OSD_DEMO_CELL_W) {
+                b = (int16_t)OSD_DEMO_CELL_W;
+            }
+            for (int16_t p = a; p < b; p++) {
+                pix[p] = fC[f];
+            }
+        }
+        uint8_t inv = 0;
+        osdDemoTwisterEncodeCell(pix, &glyphs[x], &inv);
+    }
+}
+
+static void osdDemoPaintTwister(void)
 {
     if (!demoDisplay) {
         return;
     }
+    max7456FillScreen(OSD_DEMO_TWISTER_GLYPH_B);
+}
+
+// uint32 mul — (uint16)y*256 overflows for y≥256 and warps the lower third of the twist.
+static uint8_t osdDemoTwisterTwistPhase(uint8_t rot, uint16_t sampleY, uint16_t span)
+{
+    if (span == 0) {
+        return rot;
+    }
+    return (uint8_t)(rot + (uint8_t)(((uint32_t)sampleY * (uint32_t)OSD_DEMO_TWISTER_TWIST_NUM) / (uint32_t)span));
+}
+
+// Fixed wavelengths → the phase velocity is the same on every line. The old single sine
+// with a time-varying integer period moved ∝ y (up to 4–5 px per field at the bottom vs
+// 2 px at the top); consecutive interlaced fields with different geometry then read as
+// square notches that grow toward the bottom of the screen.
+static int8_t osdDemoTwisterBendAt(uint8_t rotA, uint16_t sampleY, uint8_t rotB)
+{
+    const uint8_t phA = (uint8_t)(rotA
+        + (uint8_t)(((uint32_t)sampleY * 256u) / OSD_DEMO_TWISTER_BEND_WAVE_A));
+    const uint8_t phB = (uint8_t)(rotB
+        - (uint8_t)(((uint32_t)sampleY * 256u) / OSD_DEMO_TWISTER_BEND_WAVE_B));
+    return (int8_t)(((int16_t)osdDemoSineAt(phA) * (int16_t)OSD_DEMO_TWISTER_BEND_AMP_A
+                     + (int16_t)osdDemoSineAt(phB) * (int16_t)OSD_DEMO_TWISTER_BEND_AMP_B) / 128);
+}
+
+// VSYNC→VSYNC is exactly 312.5 PAL lines. Track the real line period in DWT ticks (Q16)
+// instead of trusting a 64 us integer: any MCU-vs-video clock error accumulates linearly
+// down the field and pushes the bottom rows' bursts into lit lines. Heavy IIR because
+// each edge carries STAT-poll jitter (a few us).
+static void osdDemoMgTrackLinePeriod(uint32_t edgeTicks, uint32_t nominalLineTicks)
+{
+    const uint32_t nominalQ16 = nominalLineTicks << 16;
+    if (mgLineQ16 == 0) {
+        mgLineQ16 = nominalQ16;
+    }
+    if (mgLastEdgeTicks != 0) {
+        const uint32_t fieldTicks = edgeTicks - mgLastEdgeTicks;
+        const uint32_t nominalField = (nominalLineTicks * (uint32_t)OSD_DEMO_PAL_FIELD_LINES_X2) / 2u;
+        // ±5%: still rejects missed VSYNCs (2×) and glitches, but accepts real off-nominal
+        // sources — on HAKRCF411D + this camera VSYNC→VSYNC is ~20.43 ms in DWT ticks
+        // (line ≈ 65.4 "us"): a ±0.5% gate rejected every field and left the model at
+        // 64 us, ~24 us of drift per char row = the growing corners in the lower half.
+        const uint32_t tol = nominalField / 20u;
+        mgFieldLastTicks = fieldTicks;
+        if (!(fieldTicks > nominalField - tol && fieldTicks < nominalField + tol)) {
+            mgFieldReject++;
+        }
+        if (fieldTicks > nominalField - tol && fieldTicks < nominalField + tol) {
+            const uint32_t measQ16 = (uint32_t)(((uint64_t)fieldTicks << 17)
+                                                / (uint64_t)mgFieldHalfLines);
+            if (mgLineSeeded) {
+                mgLineQ16 = (uint32_t)((int32_t)mgLineQ16
+                    + (((int32_t)measQ16 - (int32_t)mgLineQ16) >> OSD_DEMO_MG_LINE_IIR_SHIFT));
+            } else {
+                mgLineQ16 = measQ16; // jump straight to the first real measurement
+                mgLineSeeded = true;
+            }
+        }
+    }
+    mgLastEdgeTicks = edgeTicks;
+}
+
+// Signed offset of `line` from the pivot row (calibrated at nominal 64 us/line).
+static inline int32_t osdDemoMgLineOffset(uint16_t line, uint32_t lineQ16)
+{
+    const int32_t dl = (int32_t)line - (int32_t)OSD_DEMO_MG_PIVOT_LINE;
+    return (int32_t)(((int64_t)dl * (int64_t)lineQ16) >> 16);
+}
+
+// Diff a built band against what Display SRAM already holds for that row and write only
+// the changed cells. Per the datasheet (p.40) every SPI display-memory write can collide
+// with the chip's own fetch and break up a character for the field — fewer writes, fewer
+// collisions, and a much shorter burst (typically 3–6 cells instead of the whole window).
+// checkDeadline: skip (leave SRAM as-is) when the burst cannot finish before finishBy.
+// Plan one row burst: cluster changed cells (clean gaps ≤ MERGE_GAP), then per cluster pick
+// the cheaper framing — one auto-increment run (DMM, DMAL, 2/cell, END = 6 + 2·span) or
+// addressed single writes (DMAL+DMDI = 4/changed cell, + DMM once after an AI run). Greedy
+// is within 0.5% of the DP optimum on the plasma; −18% bytes vs "AI runs only", and no
+// unchanged cell is ever rewritten by a single-write cluster. Returns the segment count.
+static uint8_t osdDemoMgPlanRow(uint8_t row, const uint8_t *glyphs, uint8_t winL, uint8_t winR,
+                                max7456SramSeg_t *seg)
+{
+    const uint8_t *sram = mgSram[row];
+    uint8_t nSeg = 0;
+    bool afterAi = true; // DMM state unknown at burst start
+    uint8_t x = winL;
+    while (x < winR) {
+        if (glyphs[x] == sram[x]) {
+            x++;
+            continue;
+        }
+        const uint8_t first = x;
+        uint8_t last = x;
+        uint8_t changed = 1;
+        x++;
+        while (x < winR) {
+            if (glyphs[x] != sram[x]) {
+                last = x;
+                changed++;
+                x++;
+                continue;
+            }
+            uint8_t z = x;
+            while (z < winR && glyphs[z] == sram[z]) {
+                z++;
+            }
+            if (z < winR && (uint8_t)(z - x) <= OSD_DEMO_MG_RUN_MERGE_GAP) {
+                x = z;
+            } else {
+                break;
+            }
+        }
+        const uint8_t span = (uint8_t)(last - first + 1u);
+        const uint16_t aiCost = (uint16_t)(6u + 2u * span);
+        const uint16_t singleCost = (uint16_t)((afterAi ? 2u : 0u) + 4u * changed);
+        if (span > 1u && aiCost < singleCost) {
+            seg[nSeg].col = first;
+            seg[nSeg].len = span;
+            seg[nSeg].autoInc = true;
+            nSeg++;
+            afterAi = true;
+        } else {
+            for (uint8_t c = first; c <= last; c++) {
+                if (glyphs[c] == sram[c]) {
+                    continue;
+                }
+                // Merge adjacent singles into one segment (still one DMAL per cell).
+                if (nSeg > 0 && !seg[nSeg - 1u].autoInc
+                    && (uint8_t)(seg[nSeg - 1u].col + seg[nSeg - 1u].len) == c) {
+                    seg[nSeg - 1u].len++;
+                } else {
+                    seg[nSeg].col = c;
+                    seg[nSeg].len = 1;
+                    seg[nSeg].autoInc = false;
+                    nSeg++;
+                }
+            }
+            afterAi = false;
+        }
+        x = (uint8_t)(last + 1u);
+    }
+    return nSeg;
+}
+
+static void osdDemoMgCommit(uint8_t row, const uint8_t *glyphs, const max7456SramSeg_t *seg,
+                            uint8_t nSeg, uint16_t bytes, uint32_t spent)
+{
+    for (uint8_t i = 0; i < nSeg; i++) {
+        memcpy(&mgSram[row][seg[i].col], &glyphs[seg[i].col], seg[i].len);
+    }
+    // Learn the real SPI cost per byte (clock divider, polled-loop gaps, CS overhead).
+    // A burst stretched by an IRQ (the 50 Hz PT3 tick runs inside the audio IRQ) is not an
+    // SPI measurement: one such sample used to inflate the estimate, mis-plan the next 4–5
+    // bands (torn 1-px lines) and, when large enough, overflowed the start-time maths into a
+    // ~20 s wait (the scene "hang"). Accept faster/near samples; take a slow one only if it
+    // keeps repeating.
+    if (spent > mgBurstFixedTicks) {
+        const uint32_t estTicks = mgBurstFixedTicks + (((uint32_t)bytes * mgByteTicksQ8) >> 8);
+        const bool slow = spent > estTicks + estTicks / 2u;
+        if (!slow || ++mgSlowRun >= 16u) {
+            const uint32_t perByteQ8 = ((spent - mgBurstFixedTicks) << 8) / bytes;
+            mgByteTicksQ8 = (uint32_t)((int32_t)mgByteTicksQ8
+                + (((int32_t)perByteQ8 - (int32_t)mgByteTicksQ8) >> 3));
+            mgSlowRun = 0;
+        } else {
+            mgStatSlowBursts++;
+        }
+    }
+    if (bytes > mgStatMaxBytes) {
+        mgStatMaxBytes = bytes;
+    }
+    mgStatBytes += bytes;
+    mgStatWrites++;
+}
+
+// Diff a built band against what Display SRAM already holds for that row and write only
+// the changed cells. Per the datasheet (p.40) every SPI display-memory write can collide
+// with the chip's own fetch and break up a character for the field — fewer writes, fewer
+// collisions, and a much shorter burst (typically 3–6 cells instead of the whole window).
+// checkDeadline: skip (leave SRAM as-is) when the burst cannot finish before finishBy.
+static bool osdDemoMgWriteRow(uint8_t row, const uint8_t *glyphs, uint8_t winL, uint8_t winR,
+                              uint32_t finishBy, bool checkDeadline, bool maskIrq)
+{
+    max7456SramSeg_t seg[OSD_DEMO_CHARS_PER_LINE];
+    uint16_t segLast[OSD_DEMO_CHARS_PER_LINE];
+    const uint8_t nSeg = osdDemoMgPlanRow(row, glyphs, winL, winR, seg);
+    if (nSeg == 0) {
+        return true;
+    }
+    const uint16_t addr = (uint16_t)((uint16_t)row * (uint16_t)OSD_DEMO_CHARS_PER_LINE);
+    const uint16_t bytes = max7456EncodeDisplaySramRow(addr, glyphs, seg, nSeg, segLast);
+    if (bytes == 0) {
+        return false;
+    }
+    const uint32_t estTicks = mgBurstFixedTicks + ((uint32_t)bytes * mgByteTicksQ8 >> 8);
+
+    // Deadline check and burst are atomic: the 16 kHz AY IRQ (same top priority as gyro
+    // EXTI) or its 50 Hz tracker tick must not land between "fits" and "done" and push
+    // the tail of the burst into the lit line. PRIMASK — BASEPRI cannot mask prio 0.
+#if defined(__CORTEX_M) // CMSIS core present
+    const uint32_t primask = __get_PRIMASK();
+    if (maskIrq) {
+        __disable_irq();
+    }
+#else
+    UNUSED(maskIrq);
+#endif
+    const uint32_t t0 = getCycleCounter();
+    bool ok = false;
+    if (!checkDeadline || (int32_t)(finishBy - t0) >= (int32_t)estTicks) {
+        ok = max7456SendEncodedDisplaySram(bytes);
+    }
+    const uint32_t t1 = getCycleCounter();
+#if defined(__CORTEX_M) // CMSIS core present
+    __set_PRIMASK(primask);
+#endif
+
+    if (!ok) {
+        return false;
+    }
+    osdDemoMgCommit(row, glyphs, seg, nSeg, bytes, t1 - t0);
+    return true;
+}
+
+// Race the beam: start right behind the beam in line (due−1) and require every cell to land
+// before the beam reaches it in line `due`. Per cell that is a whole line of window no matter
+// how long the burst is — a full 30-cell row fits, while "finish the burst inside the previous
+// line" (≈57 us) never can. SPI (~1.3–2.5 us/cell) is slower than the beam (~1.8 us/cell) or
+// close to it, so once behind the beam the writer stays behind; segment landing times are
+// taken from the exact encoded byte offsets.
+// No IRQ masking here: a burst can be long and the 16 kHz audio IRQ must keep running; the
+// remaining slack absorbs it.
+static bool osdDemoMgWriteRowChase(uint8_t row, const uint8_t *glyphs, uint8_t cols,
+                                   uint32_t hsyncPrev, uint32_t lineTicks)
+{
+    max7456SramSeg_t seg[OSD_DEMO_CHARS_PER_LINE];
+    uint16_t segLast[OSD_DEMO_CHARS_PER_LINE];
+    const uint8_t nSeg = osdDemoMgPlanRow(row, glyphs, 0, cols, seg);
+    if (nSeg == 0) {
+        return true;
+    }
+    const uint16_t addr = (uint16_t)((uint16_t)row * (uint16_t)OSD_DEMO_CHARS_PER_LINE);
+    const uint16_t bytes = max7456EncodeDisplaySramRow(addr, glyphs, seg, nSeg, segLast);
+    if (bytes == 0) {
+        return false;
+    }
+
+    const uint32_t cpu = clockMicrosToCycles(1);
+    const uint32_t cellQ8 = (cpu * (uint32_t)OSD_DEMO_MG_BEAM_CELL_NS * 256u) / 1000u;
+    const int32_t x0 = (int32_t)mgBeamX0Us * (int32_t)cpu;
+    const uint32_t margin = clockMicrosToCycles(OSD_DEMO_MG_CHASE_MARGIN_US);
+    const uint32_t byteT = mgByteTicksQ8; // Q8
+    const uint32_t lineBeam = hsyncPrev + (uint32_t)x0; // first OSD pixel, line due−1
+
+    // Every cell must land after the beam left it in line due−1 and before the beam reaches
+    // it in line `due`. Within one segment the writer moves at a constant rate (AI ~2 B/cell
+    // can be faster than the beam, singles ~4 B/cell slower), so its two end cells bound it.
+    uint32_t startAt = 0;
+    bool startSet = false;
+    for (uint8_t i = 0; i < nSeg; i++) {
+        const uint8_t step = seg[i].autoInc ? 2u : 4u;
+        const uint16_t lastOff = segLast[i];
+        const uint16_t firstOff = (uint16_t)(lastOff - (uint16_t)step * (seg[i].len - 1u));
+        const uint8_t xs[2] = { seg[i].col, (uint8_t)(seg[i].col + seg[i].len - 1u) };
+        const uint16_t offs[2] = { firstOff, lastOff };
+        for (uint8_t e = 0; e < 2u; e++) {
+            const uint32_t pass = lineBeam + (((uint32_t)(xs[e] + 1u) * cellQ8) >> 8) + margin;
+            const uint32_t need = pass - mgBurstFixedTicks - (((uint32_t)offs[e] * byteT) >> 8);
+            if (!startSet || (int32_t)(need - startAt) > 0) {
+                startAt = need;
+                startSet = true;
+            }
+        }
+    }
+    osdDemoWaitCycles(startAt);
+
+    // Check + burst atomic (as in scene 8): an IRQ inside the burst would push its tail past
+    // the beam. With TX-only SPI the burst is ~30 us (≤ ~45 us), the audio IRQ just waits.
+#if defined(__CORTEX_M) // CMSIS core present
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+#endif
+    const uint32_t t0 = getCycleCounter();
+    bool fits = true;
+    for (uint8_t i = 0; i < nSeg && fits; i++) {
+        const uint8_t step = seg[i].autoInc ? 2u : 4u;
+        const uint16_t lastOff = segLast[i];
+        const uint16_t firstOff = (uint16_t)(lastOff - (uint16_t)step * (seg[i].len - 1u));
+        const uint8_t xs[2] = { seg[i].col, (uint8_t)(seg[i].col + seg[i].len - 1u) };
+        const uint16_t offs[2] = { firstOff, lastOff };
+        for (uint8_t e = 0; e < 2u; e++) {
+            const uint32_t land = t0 + mgBurstFixedTicks + (((uint32_t)offs[e] * byteT) >> 8);
+            const uint32_t reach = lineBeam + lineTicks + (((uint32_t)xs[e] * cellQ8) >> 8) - margin;
+            if ((int32_t)(reach - land) < 0) {
+                fits = false;
+                break;
+            }
+        }
+    }
+    const bool ok = fits && max7456SendEncodedDisplaySram(bytes);
+    const uint32_t t1 = getCycleCounter();
+#if defined(__CORTEX_M) // CMSIS core present
+    __set_PRIMASK(primask);
+#endif
+    if (!ok) {
+        return false;
+    }
+    osdDemoMgCommit(row, glyphs, seg, nSeg, bytes, t1 - t0);
+    return true;
+}
+
+// Once per field, in VBLANK (13 lines before the first OSD line, after the equalizing
+// pulses): the absolute HSYNC phase of THIS field and which field it is. PAL field 2's VSYNC
+// starts mid-line (datasheet Fig. 6/7), so HSYNC vs VSYNC differs by ½ line (~32 us) between
+// fields. The old cross-field IIR averaged the two and left race-the-beam ~±16 us off in
+// every field — at the edge of its tolerance: in one field cells landed a line early, and the
+// monitor weaving both fields showed a ±1-line comb ("grid"). Parity also lets animations
+// advance once per frame on the right field.
+static void osdDemoMgMeasureFieldPhase(uint32_t vsyncEdge, uint32_t row0, uint32_t lineTicks)
+{
+    const uint32_t model = row0 - (uint32_t)OSD_DEMO_MG_FIELD_PHASE_LINES * lineTicks;
+    osdDemoWaitCycles(model - lineTicks * 3u / 8u);
+
+    uint32_t edge = 0;
+    max7456MidGlyphSpiBoost(false); // STAT polling is unreliable at the boosted clock
+    const bool ok = max7456WaitHsyncFallingEdge(&edge, 150); // ≥2 chances at a short pulse
+    max7456MidGlyphSpiBoost(true);
+    if (!ok) {
+        mgHsyncMiss++;
+        mgFieldFirst = !mgFieldFirst; // fields alternate
+        if (mgHsyncPhaseByValid[mgFieldFirst]) {
+            mgHsyncPhase = mgHsyncPhaseBy[mgFieldFirst];
+        }
+        return;
+    }
+    int32_t ph = (int32_t)(edge - model);
+    const int32_t half = (int32_t)lineTicks / 2;
+    while (ph > half) {
+        ph -= (int32_t)lineTicks;
+    }
+    while (ph < -half) {
+        ph += (int32_t)lineTicks;
+    }
+    const uint32_t pv = (edge - vsyncEdge) % lineTicks;
+    mgFieldFirst = (pv < lineTicks / 4u) || (pv > lineTicks - lineTicks / 4u);
+    mgHsyncPhase = ph;
+    mgHsyncPhaseBy[mgFieldFirst] = ph;
+    mgHsyncPhaseByValid[mgFieldFirst] = true;
+}
+
+// Absolute DWT time of the HSYNC edge that starts `line` (model + HSYNC phase + row lock).
+static uint32_t osdDemoMgHsyncAt(uint16_t line, uint32_t pivot, uint32_t lineQ16)
+{
+    uint8_t row = (uint8_t)(line / (uint16_t)OSD_DEMO_CELL_H);
+    if (row >= OSD_DEMO_MG_ROWS_MAX) {
+        row = OSD_DEMO_MG_ROWS_MAX - 1u;
+    }
+    const int32_t corr = mgHsyncLock ? mgRowCorr[row] : 0;
+    return pivot + (uint32_t)(osdDemoMgLineOffset(line, lineQ16) + mgHsyncPhase + corr);
+}
+
+// Catch the real HSYNC that starts line (18·row − 1) during the 3 write-free lines before
+// a preloaded row (band 0 came from VBLANK) and learn this row's phase vs row 1.
+static void osdDemoMgHsyncMeasure(uint8_t row, uint32_t pivot, uint32_t lineQ16, int32_t *ref,
+                                       bool *haveRef)
+{
+    if (row == 0 || row >= OSD_DEMO_MG_ROWS_MAX) {
+        return;
+    }
+    const uint16_t line = (uint16_t)((uint16_t)row * (uint16_t)OSD_DEMO_CELL_H - 1u);
+    const uint32_t model = pivot + (uint32_t)osdDemoMgLineOffset(line, lineQ16);
+    const int32_t lineTicks = (int32_t)(lineQ16 >> 16);
+    const int32_t corrPrev = mgRowCorr[row - 1u];
+    osdDemoWaitCycles(model + (uint32_t)corrPrev - (uint32_t)(lineTicks * 3 / 8));
+
+    uint32_t edge = 0;
+    max7456MidGlyphSpiBoost(false); // STAT polling is unreliable at the boosted clock
+    const bool ok = max7456WaitHsyncFallingEdge(&edge, 90);
+    max7456MidGlyphSpiBoost(true);
+    if (!ok) {
+        mgHsyncMiss++;
+        return;
+    }
+    const int32_t raw = (int32_t)(edge - model);
+    if (row == 1u) {
+        *ref = raw;
+        *haveRef = true;
+        return;
+    }
+    if (!*haveRef) {
+        return;
+    }
+    int32_t d = raw - *ref;
+    while (d > lineTicks / 2) {
+        d -= lineTicks;
+    }
+    while (d < -lineTicks / 2) {
+        d += lineTicks;
+    }
+    // Reject IRQ-delayed polls once the row has converged.
+    const int32_t tol = (int32_t)clockMicrosToCycles(12);
+    if (mgRowCorrN[row] >= 8u && (d - mgRowCorr[row] > tol || mgRowCorr[row] - d > tol)) {
+        return;
+    }
+    if (mgRowCorrN[row] < 8u) {
+        mgRowCorrN[row]++;
+        mgRowCorr[row] += (d - mgRowCorr[row]) / (int32_t)mgRowCorrN[row];
+    } else {
+        mgRowCorr[row] += (d - mgRowCorr[row]) / 4;
+    }
+}
+
+static void osdDemoTwisterBuildBand(uint8_t *glyphs, uint8_t cols, uint16_t line, uint8_t rot,
+                                    uint8_t bendRot, uint8_t bendFloat, uint16_t span,
+                                    int16_t centerX, uint8_t winL, uint8_t winR)
+{
+    const uint16_t sampleY = (uint16_t)(line + (OSD_DEMO_TWISTER_BAND_PX / 2u));
+    const int16_t cx = (int16_t)(centerX + osdDemoTwisterBendAt(bendRot, sampleY, bendFloat));
+    osdDemoTwisterBuildScanline(glyphs, cols, osdDemoTwisterTwistPhase(rot, sampleY, span), cx, winL, winR);
+}
+
+static void osdDemoTwisterEnginePoll(void)
+{
+    if (!twisterArmed || !demoDisplay) {
+        return;
+    }
+
     uint8_t cols = demoDisplay->cols;
     uint8_t rows = demoDisplay->rows;
     if (cols == 0 || rows == 0) {
         return;
     }
-    max7456FillScreen(OSD_DEMO_PIXEL_OFF);
-    // Slightly left of centre so +16 HOS still keeps the bar on-screen.
-    const uint8_t x = (cols > 2u) ? (uint8_t)((cols / 2u) - 1u) : 0u;
-    for (uint8_t y = 0; y < rows; y++) {
-        max7456WriteChar(x, y, OSD_DEMO_FILL_BASE);
-        max7456CommitShadowCell((uint16_t)((uint16_t)y * (uint16_t)OSD_DEMO_CHARS_PER_LINE + x),
-                                OSD_DEMO_FILL_BASE, false);
+    if (cols > OSD_DEMO_CHARS_PER_LINE) {
+        cols = OSD_DEMO_CHARS_PER_LINE;
     }
-    // Corner fiducials — right edge must stay fully visible at HOS=B.
-    max7456WriteChar(0, 0, OSD_DEMO_FILL_BASE);
-    max7456WriteChar((uint8_t)(cols - 1), 0, OSD_DEMO_FILL_BASE);
-    max7456WriteChar(0, (uint8_t)(rows - 1), OSD_DEMO_FILL_BASE);
-    max7456WriteChar((uint8_t)(cols - 1), (uint8_t)(rows - 1), OSD_DEMO_FILL_BASE);
-}
-
-static void osdDemoHosTestEnginePoll(void)
-{
-    if (!hosTestArmed || !demoDisplay) {
-        return;
+    if (rows > OSD_DEMO_MG_ROWS_MAX) {
+        rows = OSD_DEMO_MG_ROWS_MAX;
     }
 
-    const uint32_t lineTicks = clockMicrosToCycles(rasterLineUs ? rasterLineUs : OSD_DEMO_RASTER_LINE_US_DEFAULT);
-    const uint32_t row0Us = OSD_DEMO_RASTER_VBLANK_US;
-    const uint32_t midLineTicks = lineTicks / 2u;
-    const uint16_t line = hosTestLine;
+    const int16_t centerX = (int16_t)(((uint16_t)cols * (uint16_t)OSD_DEMO_CELL_W) / 2u);
+
+    // Fixed build window covers silhouette + geometric bend; the SPI burst is only the
+    // cells inside it that actually changed (see osdDemoMgWriteRow).
+    int16_t winPx0 = (int16_t)(centerX - (int16_t)OSD_DEMO_TWISTER_AMP_PX
+                               - (int16_t)OSD_DEMO_TWISTER_WIN_MARGIN_PX);
+    int16_t winPx1 = (int16_t)(centerX + (int16_t)OSD_DEMO_TWISTER_AMP_PX
+                               + (int16_t)OSD_DEMO_TWISTER_WIN_MARGIN_PX);
+    if (winPx0 < 0) {
+        winPx0 = 0;
+    }
+    const int16_t screenW = (int16_t)((uint16_t)cols * (uint16_t)OSD_DEMO_CELL_W);
+    if (winPx1 > screenW) {
+        winPx1 = screenW;
+    }
+    uint8_t winL = (uint8_t)(winPx0 / (int16_t)OSD_DEMO_CELL_W);
+    uint8_t winR = (uint8_t)((winPx1 + (int16_t)OSD_DEMO_CELL_W - 1) / (int16_t)OSD_DEMO_CELL_W);
+    if (winR > cols) {
+        winR = cols;
+    }
+    if (winL >= winR) {
+        winL = 0;
+        winR = cols;
+    }
+
+    const uint32_t burstTicks = clockMicrosToCycles(OSD_DEMO_TWISTER_BURST_US);
+    const uint32_t padTicks = clockMicrosToCycles(OSD_DEMO_TWISTER_PAD_US);
+    const uint32_t wrLeadTicks = clockMicrosToCycles(OSD_DEMO_TWISTER_WR_LEAD_US);
+    const uint32_t nominalLineTicks = clockMicrosToCycles(OSD_DEMO_PAL_LINE_US);
+    const uint32_t pivotTicks = clockMicrosToCycles(OSD_DEMO_PAL_VBLANK_US
+        + OSD_DEMO_MG_PIVOT_LINE * OSD_DEMO_PAL_LINE_US);
+    if (mgBurstFixedTicks == 0) {
+        mgBurstFixedTicks = clockMicrosToCycles(OSD_DEMO_MG_BURST_FIXED_US);
+    }
+    if (mgByteTicksQ8 == 0) {
+        // Seed: the old fixed 30 us budget covered a full 14-cell 16-bit burst (36 bytes).
+        mgByteTicksQ8 = (burstTicks << 8) / 36u;
+    }
+    uint16_t span = OSD_DEMO_TWISTER_LINE_SPAN;
+    {
+        const uint16_t byRows = (uint16_t)rows * (uint16_t)OSD_DEMO_CELL_H;
+        if (byRows < span) {
+            span = byRows;
+        }
+    }
 
     max7456MidGlyphSpiBegin();
+    max7456WriteHosSigned(0); // neutral — bend is geometric only
 
     uint8_t vsyncFails = 0;
-    while (active && hosTestArmed && !ARMING_FLAG(ARMED)) {
+    while (active && twisterArmed && !ARMING_FLAG(ARMED)) {
+        if (!fxHold && (millis() - fxStartMs) >= OSD_DEMO_FX_TWISTER_MS) {
+            twisterArmed = false;
+            break;
+        }
         uint32_t edgeTicks = 0;
-        if (!max7456WaitVsyncFallingEdge(&edgeTicks, OSD_DEMO_RASTER_VSYNC_TIMEOUT_US)) {
+        max7456MidGlyphSpiBoost(false);
+        if (!max7456WaitVsyncFallingEdge(&edgeTicks, OSD_DEMO_PAL_VSYNC_TIMEOUT_US)) {
+            mgLastEdgeTicks = 0;
             if (++vsyncFails >= 8) {
-                hosTestArmed = false;
+                twisterArmed = false;
                 break;
             }
 #ifdef USE_CLI
@@ -2186,25 +3103,141 @@ static void osdDemoHosTestEnginePoll(void)
             continue;
         }
         vsyncFails = 0;
-        vsyncLockCount++;
-        vsyncLastEdgeTicks = edgeTicks;
+        mgStatFields++;
 
-        const uint8_t phase = (uint8_t)(hosTestField++ & 3u);
-        if (phase == 0u) {
-            // Whole-field A — visible LEFT reference (~25% of time).
-            max7456WriteHosNow(OSD_DEMO_HOSTEST_HOS_A);
-        } else if (phase == 1u) {
-            // Whole-field B — visible RIGHT reference; bar must jump vs phase 0.
-            max7456WriteHosNow(OSD_DEMO_HOSTEST_HOS_B);
-        } else {
-            // Mid-line poke A→B on hosTestLine.
-            max7456WriteHosNow(OSD_DEMO_HOSTEST_HOS_A);
-            const uint32_t pokeAt = edgeTicks
-                + clockMicrosToCycles(row0Us)
-                + (uint32_t)line * lineTicks
-                + midLineTicks;
-            osdDemoRasterWaitUntil(pokeAt);
-            max7456WriteHosNow(OSD_DEMO_HOSTEST_HOS_B);
+        osdDemoMgTrackLinePeriod(edgeTicks, nominalLineTicks);
+        const uint32_t lineQ16 = mgLineQ16;
+        const uint32_t lineTicks = lineQ16 >> 16;
+
+        const uint32_t pivot = edgeTicks + pivotTicks
+            + (uint32_t)(int32_t)((int32_t)mgShiftUs * (int32_t)clockMicrosToCycles(1));
+        // First lit line from the same measured model as every band (not VSYNC + 1504 us:
+        // with a 65.4 us line that is ~200 us = 3 lines too late, and the VBLANK preload
+        // then ran into row 0 and made its band 1 miss the beam).
+        const uint32_t row0 = pivot + (uint32_t)osdDemoMgLineOffset(0, lineQ16);
+        osdDemoMgMeasureFieldPhase(edgeTicks, row0, lineTicks);
+
+        const uint8_t rot = twisterPhase;
+        const uint8_t bendRot = twisterBendPhase;
+        const uint8_t bendFloat = twisterBendFloat;
+        if (!twisterFreeze) {
+            const bool perField = (twisterPairParity == OSD_DEMO_TWISTER_PAIR_OFF);
+            // New frame starts on field 1 (twpair 0) or field 2 (twpair 1, if the guess is off).
+            if (perField || mgFieldFirst == (twisterPairParity == 0u)) {
+                const uint8_t k = perField ? 1u : 2u;
+                twisterPhase = (uint8_t)(twisterPhase + k * OSD_DEMO_TWISTER_ROT_STEP);
+                twisterBendPhase = (uint8_t)(twisterBendPhase + k * OSD_DEMO_TWISTER_BEND_ROT_STEP);
+                twisterBendFloat = (uint8_t)(twisterBendFloat + k * OSD_DEMO_TWISTER_BEND_FLOAT_STEP);
+            }
+        }
+        max7456MidGlyphSpiBoost(true);
+
+        // VBLANK preload: band-0 of as many character rows as fit (plasma top-shear fix).
+        // Only band 0 — later bands must rewrite mid-glyph or the whole cell sticks on the
+        // last preloaded geometry.
+        const uint32_t blankDeadline = row0 - burstTicks;
+        uint8_t rowsPre = 0;
+        for (; rowsPre < rows; rowsPre++) {
+            if ((int32_t)(getCycleCounter() - blankDeadline) > 0) {
+                break;
+            }
+            const uint16_t line0 = (uint16_t)((uint16_t)rowsPre * (uint16_t)OSD_DEMO_CELL_H);
+            if (line0 >= span) {
+                break;
+            }
+            osdDemoTwisterBuildBand(twisterGlyphBuf[0], cols, line0, rot, bendRot, bendFloat,
+                                    span, centerX, winL, winR);
+            (void)osdDemoMgWriteRow(rowsPre, twisterGlyphBuf[0], winL, winR, 0, false, true);
+        }
+
+        int32_t hsyncRef = 0;
+        bool hsyncHaveRef = false;
+
+        uint8_t cur = 0;
+        bool have = false;
+        // First mid-field band: row0 band1 if preloaded, else row0 band0.
+        uint16_t line = 0;
+        if (rowsPre > 0) {
+            line = OSD_DEMO_TWISTER_BAND_PX; // skip preloaded band0 of row 0
+        }
+        if (line < span) {
+            osdDemoTwisterBuildBand(twisterGlyphBuf[cur], cols, line, rot, bendRot, bendFloat,
+                                    span, centerX, winL, winR);
+            have = true;
+        }
+
+        for (; line < span; line = (uint16_t)(line + OSD_DEMO_TWISTER_BAND_PX)) {
+            const uint8_t row = (uint8_t)(line / (uint16_t)OSD_DEMO_CELL_H);
+            const uint8_t bandInRow = (uint8_t)((line % (uint16_t)OSD_DEMO_CELL_H)
+                                                / (uint16_t)OSD_DEMO_TWISTER_BAND_PX);
+            // Band 0 already written in VBLANK for the first rowsPre rows.
+            if (row < rowsPre && bandInRow == 0u) {
+                if (mgHsyncLock) {
+                    osdDemoMgHsyncMeasure(row, pivot, lineQ16, &hsyncRef, &hsyncHaveRef);
+                }
+                continue;
+            }
+
+            const int32_t rowCorr = mgHsyncLock ? mgRowCorr[row] : 0;
+            const uint32_t due = pivot + (uint32_t)(osdDemoMgLineOffset(line, lineQ16) + rowCorr);
+            uint32_t wrAt = due - lineTicks + wrLeadTicks;
+            const uint32_t finishBy = due - padTicks;
+            if ((int32_t)(wrAt - edgeTicks) < 0) {
+                wrAt = edgeTicks;
+            }
+
+            const uint16_t nextLine = (uint16_t)(line + OSD_DEMO_TWISTER_BAND_PX);
+            uint16_t prefetchLine = nextLine;
+            while (prefetchLine < span) {
+                const uint8_t nr = (uint8_t)(prefetchLine / (uint16_t)OSD_DEMO_CELL_H);
+                const uint8_t nb = (uint8_t)((prefetchLine % (uint16_t)OSD_DEMO_CELL_H)
+                                             / (uint16_t)OSD_DEMO_TWISTER_BAND_PX);
+                if (!(nr < rowsPre && nb == 0u)) {
+                    break;
+                }
+                prefetchLine = (uint16_t)(prefetchLine + OSD_DEMO_TWISTER_BAND_PX);
+            }
+
+            bool builtNext = false;
+            if ((int32_t)(getCycleCounter() - wrAt) < 0) {
+                if (prefetchLine < span) {
+                    osdDemoTwisterBuildBand(twisterGlyphBuf[cur ^ 1u], cols, prefetchLine, rot,
+                                            bendRot, bendFloat, span, centerX, winL, winR);
+                    builtNext = true;
+                }
+                osdDemoWaitCycles(wrAt);
+            }
+
+            if (!have) {
+                if (prefetchLine < span && !builtNext) {
+                    osdDemoTwisterBuildBand(twisterGlyphBuf[cur ^ 1u], cols, prefetchLine, rot,
+                                            bendRot, bendFloat, span, centerX, winL, winR);
+                    builtNext = true;
+                }
+                if (builtNext) {
+                    cur ^= 1u;
+                    have = true;
+                }
+                continue;
+            }
+
+            if (!osdDemoMgWriteRow(row, twisterGlyphBuf[cur], winL, winR, finishBy, true, true)) {
+                mgStatSkips++;
+                if (mgStatSkipRow[row] < UINT16_MAX) {
+                    mgStatSkipRow[row]++;
+                }
+            }
+
+            if (prefetchLine < span) {
+                if (!builtNext) {
+                    osdDemoTwisterBuildBand(twisterGlyphBuf[cur ^ 1u], cols, prefetchLine, rot,
+                                            bendRot, bendFloat, span, centerX, winL, winR);
+                }
+                cur ^= 1u;
+                have = true;
+            } else {
+                have = false;
+            }
         }
 
 #ifdef USE_CLI
@@ -2212,11 +3245,133 @@ static void osdDemoHosTestEnginePoll(void)
             (void)cliProcess();
         }
 #endif
+        max7456MidGlyphSpiBoost(false);
     }
 
+    max7456WriteHosSigned(0);
     max7456ResetHudMotionOffset();
     max7456ApplyHudMotionNow();
     max7456MidGlyphSpiEnd();
+}
+
+void osdDemoTwisterSetFieldHalfLines(uint16_t halfLines)
+{
+    if (halfLines >= 620u && halfLines <= 630u && halfLines != mgFieldHalfLines) {
+        mgFieldHalfLines = halfLines;
+        mgLineQ16 = 0; // re-seed from the next real measurement
+        mgLineSeeded = false;
+    }
+}
+
+uint16_t osdDemoTwisterGetFieldHalfLines(void)
+{
+    return mgFieldHalfLines;
+}
+
+void osdDemoTwisterSetHsyncLock(bool enable)
+{
+    mgHsyncLock = enable;
+    memset(mgRowCorr, 0, sizeof(mgRowCorr));
+    memset(mgRowCorrN, 0, sizeof(mgRowCorrN));
+}
+
+bool osdDemoTwisterGetHsyncLock(void)
+{
+    return mgHsyncLock;
+}
+
+void osdDemoTwisterSetPair(uint8_t mode)
+{
+    twisterPairParity = (mode > OSD_DEMO_TWISTER_PAIR_OFF) ? OSD_DEMO_TWISTER_PAIR_OFF : mode;
+}
+
+uint8_t osdDemoTwisterGetPair(void)
+{
+    return twisterPairParity;
+}
+
+void osdDemoTwisterSetFreeze(bool freeze)
+{
+    twisterFreeze = freeze;
+}
+
+bool osdDemoTwisterGetFreeze(void)
+{
+    return twisterFreeze;
+}
+
+void osdDemoTwisterGetPhases(uint8_t *rot, uint8_t *bendA, uint8_t *bendB)
+{
+    *rot = twisterPhase;
+    *bendA = twisterBendPhase;
+    *bendB = twisterBendFloat;
+}
+
+void osdDemoMgSetBeamX0Us(int16_t us)
+{
+    mgBeamX0Us = constrain(us, -20, 40);
+}
+
+int16_t osdDemoMgGetBeamX0Us(void)
+{
+    return mgBeamX0Us;
+}
+
+void osdDemoTwisterSetShiftUs(int16_t us)
+{
+    mgShiftUs = constrain(us, -200, 200);
+}
+
+int16_t osdDemoTwisterGetShiftUs(void)
+{
+    return mgShiftUs;
+}
+
+static void osdDemoMgResetStats(void)
+{
+    osdDemoTwisterStats_t st;
+    osdDemoTwisterGetStats(&st, true);
+}
+
+void osdDemoTwisterGetStats(osdDemoTwisterStats_t *st, bool reset)
+{
+    if (!st) {
+        return;
+    }
+    st->fields = mgStatFields;
+    st->writes = mgStatWrites;
+    st->skips = mgStatSkips;
+    st->maxBytes = mgStatMaxBytes;
+    st->lineQ16 = mgLineQ16;
+    st->byteTicksQ8 = mgByteTicksQ8;
+    st->cyclesPerUs = clockMicrosToCycles(1);
+    st->fieldTicks = mgFieldLastTicks;
+    st->idleTicks = mgStatIdleTicks;
+    st->bytes = mgStatBytes;
+    st->phaseField1 = mgHsyncPhaseBy[1];
+    st->phaseField2 = mgHsyncPhaseBy[0];
+    st->slowBursts = mgStatSlowBursts;
+
+    st->fieldReject = mgFieldReject;
+    st->hsyncMiss = mgHsyncMiss;
+    st->hsyncLock = mgHsyncLock;
+    for (uint8_t r = 0; r < OSD_DEMO_MG_ROWS_MAX; r++) {
+        st->rowCorrTicks[r] = mgRowCorr[r];
+    }
+    memcpy(st->skipRow, mgStatSkipRow, sizeof(st->skipRow));
+    if (reset) {
+        mgStatFields = 0;
+        mgStatWrites = 0;
+        mgStatSkips = 0;
+        mgStatMaxBytes = 0;
+        memset(mgStatSkipRow, 0, sizeof(mgStatSkipRow));
+        mgFieldReject = 0;
+        mgStatIdleTicks = 0;
+        mgStatBytes = 0;
+        mgStatSlowBursts = 0;
+
+        mgHsyncMiss = 0;
+    }
 }
 
 static void osdDemoEnterFx(osdDemoFx_e next) __attribute__((noinline));
@@ -2231,8 +3386,7 @@ static void osdDemoEnterFx(osdDemoFx_e next)
     punchVel = 0;
     punchArmed = false;
     plasma2x2Armed = false;
-    hosTestArmed = false;
-    rasterEngineArmed = false;
+    twisterArmed = false;
     memset(prevRowBright, 0xFF, sizeof(prevRowBright));
     max7456Invalidate();
     if (next == OSD_DEMO_FX_PLASMA) {
@@ -2302,15 +3456,12 @@ static void osdDemoEnterFx(osdDemoFx_e next)
     } else if (next == OSD_DEMO_FX_PLASMA2X2) {
         plasmaPhase = 0;
         plasmaPhaseDiv = 0;
-        rasterEngineArmed = false;
         max7456Osdm(0x1B);
         max7456Brightness(0, 3);
         max7456SetBackgroundType(DISPLAY_BACKGROUND_BLACK);
         max7456SetHudMotionOffset(0, 0);
         // Solid PX22 into NVM. EndFontWrite — WriteNvm leaves OSD off.
-        for (uint8_t i = 0; i < OSD_DEMO_PX22_GLYPHS; i++) {
-            (void)max7456WriteNvm((uint8_t)(OSD_DEMO_PX22_BASE + i), osdDemoPx22Nvm[i]);
-        }
+        (void)osdDemoWritePx22Glyphs();
         max7456EndFontWrite();
         if (demoDisplay) {
             osdDemoFillRowsGlyphFast(demoDisplay->cols, demoDisplay->rows,
@@ -2318,30 +3469,31 @@ static void osdDemoEnterFx(osdDemoFx_e next)
         } else {
             max7456FillScreen(OSD_DEMO_PX22_BASE);
         }
+        // 0xFF never appears in a PX22 row (it is the auto-increment escape), so the first
+        // field rewrites every cell and the mirror is exact from then on.
+        memset(mgSram, 0xFF, sizeof(mgSram));
+        mgLastEdgeTicks = 0;
+        osdDemoMgResetStats();
         plasma2x2Armed = true;
-    } else if (next == OSD_DEMO_FX_RASTER) {
-        rasterStaticPainted = false;
-        rasterLastPulseUs = 0;
-        max7456Osdm(0x1B);
-        max7456Brightness(0, 3);
-        max7456SetBackgroundType(DISPLAY_BACKGROUND_BLACK);
-        max7456SetHudMotionOffset(0, 0);
-        max7456FillScreen(OSD_DEMO_PIXEL_OFF);
-        osdDemoPaintRaster();
-        max7456RefreshAll();
-        rasterStaticPainted = true;
-    } else if (next == OSD_DEMO_FX_HOSTEST) {
-        rasterEngineArmed = false;
+    } else if (next == OSD_DEMO_FX_TWISTER) {
         plasma2x2Armed = false;
         max7456Osdm(0x1B);
         max7456Brightness(0, 3);
         max7456SetBackgroundType(DISPLAY_BACKGROUND_BLACK);
         max7456SetHudMotionOffset(0, 0);
-        osdDemoPaintHosTest();
+        // X-fill edge glyphs once; never rewrite NVM during animation.
+        osdDemoTwisterInstallXFillGlyphs();
+        osdDemoPaintTwister();
         max7456RefreshAll();
-        hosTestField = 0;
-        max7456WriteHosNow(OSD_DEMO_HOSTEST_HOS_A);
-        hosTestArmed = true;
+        // RefreshAll leaves every twister cell black — seed the SRAM mirror to match.
+        memset(mgSram, OSD_DEMO_TWISTER_GLYPH_B, sizeof(mgSram));
+        mgLastEdgeTicks = 0;
+        osdDemoMgResetStats();
+        twisterPhase = 0;
+        twisterBendPhase = 0;
+        twisterBendFloat = 0;
+        max7456WriteHosSigned(0);
+        twisterArmed = true;
     } else {
         bounceStartMs = millis();
         prevBouncePhase = 0;
@@ -2351,9 +3503,8 @@ static void osdDemoEnterFx(osdDemoFx_e next)
         osdDemoPaintScroller();
     }
     // First frame of every scene: same vsync+SPI drain as the steady Update path.
-    // Raster / mid-glyph plasma / HOS probe own the chip directly — skip shadow flush.
-    if (next != OSD_DEMO_FX_RASTER && next != OSD_DEMO_FX_PLASMA2X2
-        && next != OSD_DEMO_FX_HOSTEST) {
+    // Mid-glyph scenes own the chip directly — skip shadow flush.
+    if (next != OSD_DEMO_FX_PLASMA2X2 && next != OSD_DEMO_FX_TWISTER) {
         hosWrappedThisStep = false;
         osdDemoSyncFlush(true, true);
     }
@@ -2428,9 +3579,6 @@ static void osdDemoPaintPlasma(void)
     uint16_t levelSum = 0;
     uint16_t levelCount = 0;
     for (uint8_t y = plasmaY0; y < plasmaY1; y++) {
-#ifdef USE_CHIPTUNE
-        beeperPwmAyFifoFill();
-#endif
         const uint8_t local = (uint8_t)(y - plasmaY0);
         const int8_t cy = (int8_t)(((uint16_t)local * 31u) / yDiv);
         for (uint8_t x = 0; x < cols; x++) {
@@ -2540,1114 +3688,27 @@ static void osdDemoPaintScroller(void)
 }
 
 
-static uint16_t osdDemoRasterAddr(void)
+
+static void osdDemoWaitCycles(uint32_t deadlineTicks)
 {
-    return (uint16_t)(rasterY * OSD_DEMO_CHARS_PER_LINE + rasterX);
-}
-
-// VSYNC falling edge → top scanline of probe glyph (µs, for CLI/stats).
-// phase = VBLANK_US + Y * 18 * line_us  (VBLANK calibrated @ Y=8 → 10720).
-uint16_t osdDemoRasterComputeCellTopPhaseUs(void)
-{
-    const uint32_t us = (uint32_t)OSD_DEMO_RASTER_VBLANK_US
-        + (uint32_t)rasterY * (uint32_t)OSD_DEMO_RASTER_GLYPH_ROWS * (uint32_t)rasterLineUs;
-    if (us > OSD_DEMO_RASTER_DELAY_MAX_US) {
-        return OSD_DEMO_RASTER_DELAY_MAX_US;
+    const int32_t ahead = (int32_t)(deadlineTicks - getCycleCounter());
+    if (ahead > 0) {
+        mgStatIdleTicks += (uint32_t)ahead; // time spent waiting for the beam (load stat)
     }
-    return (uint16_t)us;
-}
-
-// Same instant as phase, but in HSYNC line counts (diag scheduling).
-uint16_t osdDemoRasterComputeCellTopLine(void)
-{
-    if (rasterLineUs == 0) {
-        return 0;
-    }
-    // Prefer current phase (auto or user-tuned) so `phase 10720` maps to lines.
-    return (uint16_t)(rasterDelayUs / rasterLineUs);
-}
-
-uint16_t osdDemoRasterApplyAutoPhase(void)
-{
-    rasterPhaseAuto = true;
-    rasterDelayUs = osdDemoRasterComputeCellTopPhaseUs();
-    rasterPhaseTicks = clockMicrosToCycles(rasterDelayUs);
-    osdDemoRasterClampPhaseToPeriod();
-    return rasterDelayUs;
-}
-
-static uint16_t osdDemoCalClampDelay(int32_t v)
-{
-    if (v < 0) {
-        return 0;
-    }
-    if (v > (int32_t)OSD_DEMO_RASTER_DELAY_MAX_US) {
-        return OSD_DEMO_RASTER_DELAY_MAX_US;
-    }
-    return (uint16_t)v;
-}
-
-static void osdDemoRasterCalSyncDynamic(void)
-{
-    calDynamicUs = osdDemoCalClampDelay((int32_t)calCenterUs + (int32_t)calOffsetUs);
-    rasterDelayUs = calDynamicUs;
-    // CAL sweeps phase; period stays independently tunable.
-    rasterPhaseTicks = clockMicrosToCycles(calDynamicUs);
-    osdDemoRasterClampPhaseToPeriod();
-}
-
-static void osdDemoRasterCalReset(void)
-{
-    calCenterUs = OSD_DEMO_CAL_CENTER_INIT_US;
-    calRangeUs = OSD_DEMO_CAL_RANGE_INIT_US;
-    calOffsetUs = 0;
-    calSweepDir = 1;
-    calSweepLastMs = millis();
-    calSweepPhaseMs = OSD_DEMO_CAL_SWEEP_MS / 4u; // start at offset≈0 (mid up-ramp)
-    calLastDynSlot = 0xFF;
-    calUiForce = true;
-    osdDemoRasterCalSyncDynamic();
-}
-
-static void osdDemoRasterCalCatch(void)
-{
-    // Visual match (probe == solid white refs) → lock centre, halve search window, keep sweeping.
-    calCenterUs = calDynamicUs;
-    uint16_t newRange = (uint16_t)(calRangeUs / 2u);
-    if (newRange < OSD_DEMO_CAL_RANGE_MIN_US) {
-        newRange = OSD_DEMO_CAL_RANGE_MIN_US;
-    }
-    calRangeUs = newRange;
-    calOffsetUs = 0;
-    calSweepDir = 1;
-    calSweepLastMs = millis();
-    // Keep phase at mid-ramp so we don't jump; sweep must keep moving even for small range.
-    calSweepPhaseMs = OSD_DEMO_CAL_SWEEP_MS / 4u;
-    calLastDynSlot = 0xFF;
-    calUiForce = true;
-    osdDemoRasterCalSyncDynamic();
-    rasterStaticPainted = false;
-}
-
-static void osdDemoRasterCalCommit(void)
-{
-    // Lock delay and drop to plain GLYPH probe with tick engine.
-    rasterDelayUs = calCenterUs;
-    calDynamicUs = calCenterUs;
-    calOffsetUs = 0;
-    rasterPhaseTicks = clockMicrosToCycles(calCenterUs);
-    osdDemoRasterClampPhaseToPeriod();
-    rasterMode = OSD_DEMO_RASTER_GLYPH;
-    rasterStaticPainted = false;
-    osdDemoPaintRaster();
-    max7456RefreshAll();
-    rasterStaticPainted = true;
-}
-
-
-void osdDemoRasterCalGet(uint16_t *centerUs, uint16_t *rangeUs, uint16_t *dynamicUs)
-{
-    if (centerUs) {
-        *centerUs = calCenterUs;
-    }
-    if (rangeUs) {
-        *rangeUs = calRangeUs;
-    }
-    if (dynamicUs) {
-        *dynamicUs = calDynamicUs;
-    }
-}
-
-void osdDemoRasterCalEvent(uint8_t event)
-{
-    if (!active || fx != OSD_DEMO_FX_RASTER || rasterMode != OSD_DEMO_RASTER_CAL) {
-        return;
-    }
-    if (event == 0) {
-        osdDemoRasterCalCatch();
-    } else if (event == 1) {
-        osdDemoRasterCalCommit();
-    } else {
-        osdDemoRasterCalReset();
-        rasterStaticPainted = false;
-    }
-}
-
-static void osdDemoRasterCalAdvanceSweep(void)
-{
-    const timeMs_t now = millis();
-    timeMs_t dt = (timeMs_t)(now - calSweepLastMs);
-    if (dt == 0) {
-        return;
-    }
-    calSweepLastMs = now;
-
-    // Phase-based triangle — avoids integer step=0 when range is small (e.g. ±250).
-    calSweepPhaseMs += (uint32_t)dt;
-    while (calSweepPhaseMs >= OSD_DEMO_CAL_SWEEP_MS) {
-        calSweepPhaseMs -= OSD_DEMO_CAL_SWEEP_MS;
-    }
-
-    const uint32_t half = OSD_DEMO_CAL_SWEEP_MS / 2u;
-    const uint16_t range = (calRangeUs == 0) ? 1 : calRangeUs;
-    int32_t offset;
-    if (calSweepPhaseMs <= half) {
-        // -range → +range over first half
-        offset = -(int32_t)range
-            + (int32_t)(((uint32_t)(2u * range) * calSweepPhaseMs) / half);
-    } else {
-        // +range → -range over second half
-        const uint32_t t = calSweepPhaseMs - half;
-        offset = (int32_t)range
-            - (int32_t)(((uint32_t)(2u * range) * t) / half);
-    }
-    if (offset > (int32_t)range) {
-        offset = (int32_t)range;
-    }
-    if (offset < -(int32_t)range) {
-        offset = -(int32_t)range;
-    }
-    calOffsetUs = (int16_t)offset;
-    calSweepDir = (calSweepPhaseMs <= half) ? 1 : -1;
-    osdDemoRasterCalSyncDynamic();
-}
-
-// 5×5 font → 6×6 mega-pixels into tunnel 2×3 cell patterns (same packing as tunnel text).
-static int8_t osdDemoCalTextFontRow(uint8_t cellY, uint8_t br, uint8_t textY0)
-{
-    if (cellY < textY0 || cellY >= (uint8_t)(textY0 + OSD_DEMO_CAL_TEXT_ROWS)) {
-        return -2;
-    }
-    const uint8_t band = (uint8_t)(cellY - textY0);
-    if (band == 0) {
-        return (br == 2) ? 0 : -1;
-    }
-    if (band == 1) {
-        return (int8_t)(1 + br);
-    }
-    return (br == 0) ? 4 : -1;
-}
-
-static void osdDemoPaintMpString(uint8_t textY0, const char *s, uint8_t cols, uint8_t rows)
-{
-    uint8_t len = 0;
-    while (s[len] && len < 8) {
-        len++;
-    }
-    const uint16_t totalMp = (uint16_t)(len * OSD_DEMO_CAL_DIGIT_ADV);
-    const uint16_t gridMp = (uint16_t)(cols * 2u);
-    int16_t startMx = (int16_t)((gridMp > totalMp) ? ((gridMp - totalMp) / 2) : 0);
-
-    for (uint8_t cellY = textY0; cellY < (uint8_t)(textY0 + OSD_DEMO_CAL_TEXT_ROWS) && cellY < rows; cellY++) {
-        for (uint8_t cellX = 0; cellX < cols; cellX++) {
-            uint8_t pat = 0;
-            for (uint8_t br = 0; br < 3; br++) {
-                for (uint8_t bc = 0; bc < 2; bc++) {
-                    const int8_t trow = osdDemoCalTextFontRow(cellY, br, textY0);
-                    bool on = false;
-                    if (trow >= 0) {
-                        const int16_t mx = (int16_t)(cellX * 2u + bc);
-                        const int16_t local = (int16_t)(mx - startMx);
-                        if (local >= 0 && local < (int16_t)totalMp) {
-                            const uint8_t gi = (uint8_t)(local / OSD_DEMO_CAL_DIGIT_ADV);
-                            const uint8_t px = (uint8_t)(local % OSD_DEMO_CAL_DIGIT_ADV);
-                            if (px < OSD_DEMO_FONT_W && gi < len) {
-                                on = osdDemoFontPixel((uint8_t)s[gi], px, (uint8_t)(OSD_DEMO_TUNNEL_INK_Y0 + (uint8_t)trow));
-                            }
-                        }
-                    }
-                    if (on) {
-                        pat |= (uint8_t)(1u << (br * 2u + bc));
-                    }
-                }
-            }
-            osdDemoWriteTunnelPat(cellX, cellY, rows, pat);
-        }
-    }
-}
-
-static void osdDemoPaintCalScaleFixed(uint8_t y, uint8_t cols, uint8_t rows)
-{
-    if (y >= rows) {
-        return;
-    }
-    for (uint8_t x = 0; x < cols; x++) {
-        max7456WriteChar(x, y, OSD_DEMO_PIXEL_OFF);
-    }
-    // Reference caret only — nothing else on this row.
-    max7456WriteChar((uint8_t)(cols / 2), y, OSD_DEMO_FILL_BASE);
-}
-
-static void osdDemoPaintCalScaleMoving(uint8_t y, uint8_t cols, uint8_t rows, int16_t markOffset, uint16_t range)
-{
-    if (y >= rows) {
-        return;
-    }
-    for (uint8_t x = 0; x < cols; x++) {
-        max7456WriteChar(x, y, OSD_DEMO_PIXEL_OFF);
-    }
-    if (range == 0) {
-        range = 1;
-    }
-    const uint8_t mid = (uint8_t)(cols / 2);
-    // Map ±range → full width; 3-cell-wide bright bar so travel is obvious.
-    int32_t slot = (int32_t)mid + ((int32_t)markOffset * (int32_t)(cols / 2 - 2)) / (int32_t)range;
-    if (slot < 1) {
-        slot = 1;
-    }
-    if (slot > (int32_t)(cols - 2)) {
-        slot = (int32_t)(cols - 2);
-    }
-    calLastDynSlot = (uint8_t)slot;
-    max7456WriteChar((uint8_t)(slot - 1), y, OSD_DEMO_FILL_BASE);
-    max7456WriteChar((uint8_t)slot, y, OSD_DEMO_FILL_BASE);
-    max7456WriteChar((uint8_t)(slot + 1), y, OSD_DEMO_FILL_BASE);
-}
-
-static void osdDemoPaintRasterCal(void)
-{
-    if (!demoDisplay) {
-        return;
-    }
-    const uint8_t cols = demoDisplay->cols;
-    const uint8_t rows = demoDisplay->rows;
-    max7456FillScreen(OSD_DEMO_PIXEL_OFF);
-    max7456SetHudMotionOffset(0, 0);
-
-    // Absolute delay (us) — mega-pixel 5×5@6×6
-    char buf[6];
-    uint16_t v = calDynamicUs;
-    buf[0] = (char)('0' + (v / 10000) % 10);
-    buf[1] = (char)('0' + (v / 1000) % 10);
-    buf[2] = (char)('0' + (v / 100) % 10);
-    buf[3] = (char)('0' + (v / 10) % 10);
-    buf[4] = (char)('0' + (v % 10));
-    buf[5] = 0;
-    const uint8_t textY0 = 0;
-    osdDemoPaintMpString(textY0, buf, cols, rows);
-
-    // Scales directly under digits.
-    const uint8_t scaleY0 = (uint8_t)(textY0 + OSD_DEMO_CAL_TEXT_ROWS + 1);
-    osdDemoPaintCalScaleFixed(scaleY0, cols, rows);
-    osdDemoPaintCalScaleMoving((uint8_t)(scaleY0 + 1), cols, rows, calOffsetUs, calRangeUs);
-
-    // Probe row: [WHITE ref][gap][LIVE probe][gap][WHITE ref]
-    // Target to catch = solid full white (no blink, no growing bar) — match the refs.
-    rasterX = (uint8_t)(cols / 2);
-    rasterY = (uint8_t)(scaleY0 + 3);
-    if (rasterY >= rows) {
-        rasterY = (uint8_t)(rows - 1);
-    }
-    const uint8_t refL = (uint8_t)((rasterX >= 3) ? (rasterX - 3) : 0);
-    const uint8_t refR = (uint8_t)((rasterX + 3 < cols) ? (rasterX + 3) : (cols - 1));
-    max7456WriteChar(refL, rasterY, OSD_DEMO_FILL_BASE);
-    if (refL + 1 < rasterX) {
-        max7456WriteChar((uint8_t)(refL + 1), rasterY, OSD_DEMO_FILL_BASE);
-    }
-    max7456WriteChar(refR, rasterY, OSD_DEMO_FILL_BASE);
-    if (refR > 0 && refR - 1 > rasterX) {
-        max7456WriteChar((uint8_t)(refR - 1), rasterY, OSD_DEMO_FILL_BASE);
-    }
-
-    const uint16_t addr = osdDemoRasterAddr();
-    max7456WriteCharEx(rasterX, rasterY, rasterGlyphA, false);
-    max7456CommitShadowCell(addr, rasterGlyphA, false);
-
-    calUiForce = false;
-}
-
-// Static marker frame + resting glyph A. Layer/shadow stay on A so drawScreen
-// will not fight the mid-pulse Display SRAM rewrite of B.
-static void osdDemoPaintRaster(void)
-{
-    if (!demoDisplay) {
-        return;
-    }
-    if (rasterMode == OSD_DEMO_RASTER_CAL) {
-        osdDemoPaintRasterCal();
-        return;
-    }
-    const uint8_t cols = demoDisplay->cols;
-    const uint8_t rows = demoDisplay->rows;
-
-    if (rasterX >= cols) {
-        rasterX = (uint8_t)(cols / 2);
-    }
-    if (rasterY >= rows) {
-        rasterY = (uint8_t)(rows / 2);
-    }
-
-    max7456FillScreen(OSD_DEMO_PIXEL_OFF);
-    max7456SetHudMotionOffset(0, 0);
-
-    if (rasterMode == OSD_DEMO_RASTER_MARK) {
-        // Top-row marker cell only — no crosshair (keeps vertical compare clean).
-        const uint16_t addr = (uint16_t)(OSD_DEMO_RASTER_MARK_Y * OSD_DEMO_CHARS_PER_LINE
-                                         + OSD_DEMO_RASTER_MARK_X);
-        max7456WriteCharEx(OSD_DEMO_RASTER_MARK_X, OSD_DEMO_RASTER_MARK_Y,
-                           OSD_DEMO_PIXEL_OFF, false);
-        max7456CommitShadowCell(addr, OSD_DEMO_PIXEL_OFF, false);
-        return;
-    }
-
-    if (rasterMode == OSD_DEMO_RASTER_DIAG) {
-        // Refs: growing dense hatch (phase for probe row).
-        const uint8_t phase = (rasterY & 1u) ? (uint8_t)OSD_DEMO_DIAG_PHASE1 : 0;
-        for (uint8_t i = 0; i < OSD_DEMO_DIAG_STEPS; i++) {
-            const uint8_t gx = (uint8_t)(rasterX - OSD_DEMO_DIAG_STEPS - 1 + i);
-            if (gx < cols) {
-                max7456WriteCharEx(gx, rasterY,
-                                   (uint8_t)(OSD_DEMO_STRIPE_BASE + phase + i), false);
-            }
-        }
-        const uint16_t addr = osdDemoRasterAddr();
-        max7456WriteCharEx(rasterX, rasterY, OSD_DEMO_PIXEL_OFF, false);
-        max7456CommitShadowCell(addr, OSD_DEMO_PIXEL_OFF, false);
-        return;
-    }
-
-    if (rasterMode == OSD_DEMO_RASTER_FILL) {
-        // Fast 2×1 hatch (F7/FD row bursts) + white corner fiducials.
-        osdDemoPaintHatch2x1Screen(cols, rows, true);
-        max7456RefreshAll();
-        return;
-    }
-
-    // Dim crosshair so the probe cell is obvious on USB capture.
-    const uint8_t mark = (uint8_t)(OSD_DEMO_HFILL_BASE + 1); // 1px white tip
-    for (uint8_t x = 0; x < cols; x++) {
-        if (x == rasterX) {
-            continue;
-        }
-        if ((x & 1) == 0) {
-            max7456WriteChar(x, rasterY, mark);
-        }
-    }
-    for (uint8_t y = 0; y < rows; y++) {
-        if (y == rasterY) {
-            continue;
-        }
-        if ((y & 1) == 0) {
-            max7456WriteChar(rasterX, y, mark);
-        }
-    }
-
-    const uint16_t addr = osdDemoRasterAddr();
-    if (rasterMode == OSD_DEMO_RASTER_INVERT) {
-        max7456WriteCharEx(rasterX, rasterY, rasterInvGlyph, false);
-        max7456CommitShadowCell(addr, rasterInvGlyph, false);
-    } else {
-        max7456WriteCharEx(rasterX, rasterY, rasterGlyphA, false);
-        max7456CommitShadowCell(addr, rasterGlyphA, false);
-    }
-}
-
-// PAL period probe: full-cell WHITE blink every markInterval software fields.
-// No mid-glyph strip — user measures real time between flashes on USB capture.
-static void osdDemoRasterMarkSetCell(uint8_t glyph)
-{
-    const uint16_t addr = (uint16_t)(OSD_DEMO_RASTER_MARK_Y * OSD_DEMO_CHARS_PER_LINE
-                                     + OSD_DEMO_RASTER_MARK_X);
-    (void)max7456WriteDisplaySramChar(addr, glyph);
-    max7456CommitShadowCell(addr, glyph, false);
-}
-
-static void osdDemoRasterMarkOnEvent(uint32_t eventIndex, uint32_t eventTick, uint32_t lateTicks)
-{
-    if (!markTestActive || markInterval == 0) {
-        return;
-    }
-    if (lateTicks > markMaxLateTicks) {
-        markMaxLateTicks = lateTicks;
-    }
-    if (lateTicks > 0) {
-        markLateEvents++;
-    }
-
-    // Flash edge every N software fields (ideal grid).
-    if ((eventIndex % markInterval) == 0) {
-        if (markStartTick != 0 || markPairComplete) {
-            // Previous flash → this flash = one measured interval.
-            markEndEvent = eventIndex;
-            markEndTick = eventTick;
-            const uint32_t n = markInterval;
-            markExpectedElapsedTicks = n * osdDemoRasterEffectivePeriodTicks();
-            markElapsedErrorTicks = (int32_t)(markEndTick - markStartTick)
-                - (int32_t)markExpectedElapsedTicks;
-            markErrorPerEventTicks = (int32_t)markElapsedErrorTicks / (int32_t)n;
-            markPairComplete = true;
-            if (!markRepeat) {
-                // Show this flash, then stop after hold.
-            }
-        }
-        markStartEvent = eventIndex;
-        markStartTick = eventTick;
-    }
-
-    const uint32_t phaseInInterval = eventIndex % markInterval;
-    const bool lit = (phaseInInterval < OSD_DEMO_RASTER_MARK_FLASH_HOLD);
-    osdDemoRasterMarkSetCell(lit ? rasterGlyphA : rasterGlyphB);
-
-    if (!markRepeat && markPairComplete
-        && eventIndex >= (markEndEvent + OSD_DEMO_RASTER_MARK_FLASH_HOLD)) {
-        markTestActive = false;
-    }
-}
-
-static void osdDemoRasterWriteA(void)
-{
-    const uint16_t addr = osdDemoRasterAddr();
-    if (rasterMode == OSD_DEMO_RASTER_INVERT) {
-        (void)max7456WriteDisplaySramChar(addr, rasterInvGlyph);
-        (void)max7456WriteDisplaySramAttr(addr, 0x00);
-        max7456CommitShadowCell(addr, rasterInvGlyph, false);
-    } else {
-        (void)max7456WriteDisplaySramChar(addr, rasterGlyphA);
-        max7456CommitShadowCell(addr, rasterGlyphA, false);
-    }
-}
-
-static void osdDemoRasterWriteB(void)
-{
-    const uint16_t addr = osdDemoRasterAddr();
-    if (rasterMode == OSD_DEMO_RASTER_INVERT) {
-        (void)max7456WriteDisplaySramAttr(addr, OSD_DEMO_RASTER_ATTR_INV);
-        max7456CommitShadowCell(addr, rasterInvGlyph, false);
-    } else {
-        (void)max7456WriteDisplaySramChar(addr, rasterGlyphB);
-        max7456CommitShadowCell(addr, rasterGlyphA, false);
-    }
-}
-
-static void osdDemoRasterEngineInit(void)
-{
-    // DWT CYCCNT @ CPU clock — monotonic, independent of OSD scheduler.
-    if (rasterDelayUs == 0) {
-        rasterDelayUs = OSD_DEMO_RASTER_DEFAULT_PHASE_US;
-    }
-    if (!periodCorrSeeded) {
-        periodCorrectionTicks = (int32_t)clockMicrosToCycles(OSD_DEMO_RASTER_CORR_DEFAULT_US);
-        periodCorrSeeded = true;
-    }
-    osdDemoRasterClampPeriodCorrection();
-    rasterPhaseTicks = clockMicrosToCycles(rasterDelayUs);
-    osdDemoRasterClampPhaseToPeriod();
-    // Ideal timeline only: next += period. Never rebase from CYCCNT.
-    rasterFieldEpoch = getCycleCounter();
-    rasterLateCount = 0;
-    rasterMaxLateTicks = 0;
-    vsyncLockCount = 0;
-    vsyncTimeoutCount = 0;
-    vsyncLastEdgeTicks = 0;
-    rasterMeasuredLineTicks = 0;
-    rasterFieldParity = 0;
-    rasterEngineArmed = true;
-}
-
-static void osdDemoRasterWriteGlyphFast(uint8_t glyph)
-{
-    const uint16_t addr = osdDemoRasterAddr();
-    (void)max7456WriteDisplaySramChar(addr, glyph);
-    max7456CommitShadowCell(addr, glyph, false);
-}
-
-static void osdDemoRasterWaitUntil(uint32_t deadlineTicks)
-{
     while ((int32_t)(getCycleCounter() - deadlineTicks) < 0) {
-    }
-}
-
-// Resync every PAL field from MAX7456 STAT[4] — no long-term period drift.
-static void osdDemoRasterVsyncEnginePoll(void)
-{
-    const bool diag = (rasterMode == OSD_DEMO_RASTER_DIAG);
-    const bool fill = (rasterMode == OSD_DEMO_RASTER_FILL);
-    const uint32_t leadTicks = clockMicrosToCycles(rasterSpiLeadUs);
-    const uint32_t fieldMin = clockMicrosToCycles(15000);
-    const uint32_t fieldMax = clockMicrosToCycles(25000);
-
-    while (active && rasterEngineArmed && !ARMING_FLAG(ARMED)) {
-        uint32_t edgeTicks = 0;
-        if (!max7456WaitVsyncFallingEdge(&edgeTicks, OSD_DEMO_RASTER_VSYNC_TIMEOUT_US)) {
-            vsyncTimeoutCount++;
-#ifdef USE_CLI
-            if (cliMode) {
-                (void)cliProcess();
-            }
-#endif
-            continue;
-        }
-
-        // Stats only — diag/fill step with nominal line_us (phase units).
-        if (vsyncLastEdgeTicks != 0) {
-            const uint32_t fieldTicks = edgeTicks - vsyncLastEdgeTicks;
-            if (fieldTicks > fieldMin && fieldTicks < fieldMax) {
-                rasterMeasuredLineTicks = (fieldTicks * 2u) / (uint32_t)OSD_DEMO_RASTER_PAL_FIELD_LINES_X2;
-            }
-        }
-
-        vsyncLockCount++;
-        vsyncLastEdgeTicks = edgeTicks;
-        rasterEventCounter++;
-        rasterFieldParity ^= 1;
-
-        if (diag) {
-            // Dense 2px diagonal hatch, cumulative mid-glyph in one probe cell.
-            const uint32_t lineTicks = clockMicrosToCycles(rasterLineUs);
-            const uint32_t stepTicks = lineTicks * (uint32_t)OSD_DEMO_DIAG_CUBE_PX;
-            const uint32_t fieldBias = rasterFieldParity ? (lineTicks / 2u) : 0;
-            const uint32_t band0 = edgeTicks + rasterPhaseTicks + fieldBias;
-            const uint8_t phase = (rasterY & 1u) ? (uint8_t)OSD_DEMO_DIAG_PHASE1 : 0;
-            for (uint8_t i = 0; i < OSD_DEMO_DIAG_STEPS; i++) {
-                const uint32_t due = band0 + (uint32_t)i * stepTicks;
-                uint32_t wrAt = due - leadTicks;
-                if ((int32_t)(wrAt - edgeTicks) < 0) {
-                    wrAt = edgeTicks;
-                }
-                osdDemoRasterWaitUntil(wrAt);
-                osdDemoRasterWriteGlyphFast((uint8_t)(OSD_DEMO_STRIPE_BASE + phase + i));
-            }
-        } else if (fill) {
-            // Hatch is static. RB0..15 is per character ROW only — cannot vary
-            // brightness left↔right; live RB not useful for horizontal split.
-        } else {
-            // Classic two-step A→B mid-glyph probe (DWT phase).
-            osdDemoRasterWriteA();
-            osdDemoRasterWaitUntil(edgeTicks + rasterPhaseTicks);
-            osdDemoRasterWriteB();
-        }
-
-#ifdef USE_CLI
-        if (cliMode) {
-            (void)cliProcess();
-        }
-#endif
-    }
-}
-
-static void osdDemoRasterEnginePoll(void)
-{
-    if (!rasterEngineArmed) {
-        return;
-    }
-
-    if (rasterMode == OSD_DEMO_RASTER_VSYNC || rasterMode == OSD_DEMO_RASTER_DIAG
-        || rasterMode == OSD_DEMO_RASTER_FILL) {
-        osdDemoRasterVsyncEnginePoll();
-        return;
-    }
-
-    const uint32_t lateSkipTicks = clockMicrosToCycles(OSD_DEMO_RASTER_LATE_SKIP_US);
-
-    // OSD task is ~12 Hz — never fire SPI from "next task tick".
-    // Deterministic DWT busy-wait across fields; pump CLI so stop/tune work.
-    while (active && rasterEngineArmed && !ARMING_FLAG(ARMED)) {
-        while (max7456DmaInProgress()) {
-            if (!active || ARMING_FLAG(ARMED)) {
-                return;
-            }
-        }
-
-        const uint32_t period = osdDemoRasterEffectivePeriodTicks();
-        uint32_t now = getCycleCounter();
-
-        uint8_t skipped = 0;
-        while ((int32_t)(now - (rasterFieldEpoch + period)) >= 0) {
-            rasterFieldEpoch += period;
-            rasterLateCount++;
-            rasterEventCounter++;
-            if (markTestActive) {
-                markLateEvents++;
-                const uint32_t late = now - (rasterFieldEpoch - period);
-                if (late > markMaxLateTicks) {
-                    markMaxLateTicks = late;
-                }
-            }
-            if (++skipped >= 8) {
-                break;
-            }
-        }
-
-        const uint32_t aAt = rasterFieldEpoch;
-        const uint32_t bAt = rasterFieldEpoch + rasterPhaseTicks;
-
-        if ((int32_t)(now - aAt) < 0) {
-            while ((int32_t)(getCycleCounter() - aAt) < 0) {
-            }
-            now = getCycleCounter();
-        }
-
-        const uint32_t lateA = now - aAt;
-        if (rasterMode == OSD_DEMO_RASTER_MARK) {
-            // Blink needs only aAt — do not require the mid-glyph bAt window.
-            if ((int32_t)(now - (aAt + period)) >= 0) {
-                if (lateA > rasterMaxLateTicks) {
-                    rasterMaxLateTicks = lateA;
-                }
-                rasterLateCount++;
-                if (markTestActive) {
-                    markLateEvents++;
-                    if (lateA > markMaxLateTicks) {
-                        markMaxLateTicks = lateA;
-                    }
-                }
-                rasterFieldEpoch += period;
-                rasterEventCounter++;
-#ifdef USE_CLI
-                if (cliMode) {
-                    (void)cliProcess();
-                }
-#endif
-                continue;
-            }
-        } else if ((int32_t)(now - bAt) >= 0 || lateA > lateSkipTicks) {
-            if (lateA > rasterMaxLateTicks) {
-                rasterMaxLateTicks = lateA;
-            }
-            rasterLateCount++;
-            if (markTestActive) {
-                markLateEvents++;
-                if (lateA > markMaxLateTicks) {
-                    markMaxLateTicks = lateA;
-                }
-            }
-            // Keep ideal grid — do not rebase from now.
-            rasterFieldEpoch += period;
-            rasterEventCounter++;
-#ifdef USE_CLI
-            if (cliMode) {
-                (void)cliProcess();
-            }
-#endif
-            continue;
-        }
-
-        if (lateA > rasterMaxLateTicks) {
-            rasterMaxLateTicks = lateA;
-        }
-
-        const uint32_t eventIndex = rasterEventCounter;
-
-        if (rasterMode == OSD_DEMO_RASTER_MARK) {
-            // Simple full-cell blink on the ideal grid — no mid-glyph phase wait.
-            if (markTestActive) {
-                osdDemoRasterMarkOnEvent(eventIndex, aAt, lateA);
-            }
-        } else {
-            osdDemoRasterWriteA();
-            while ((int32_t)(getCycleCounter() - bAt) < 0) {
-            }
-            now = getCycleCounter();
-            {
-                const uint32_t lateB = now - bAt;
-                if (lateB > rasterMaxLateTicks) {
-                    rasterMaxLateTicks = lateB;
-                }
-            }
-            osdDemoRasterWriteB();
-
-            if (rasterMode == OSD_DEMO_RASTER_SWEEP) {
-                if (rasterDelayUs >= OSD_DEMO_RASTER_DELAY_MAX_US) {
-                    rasterDelayUs = 0;
-                } else {
-                    rasterDelayUs = (uint16_t)(rasterDelayUs + OSD_DEMO_RASTER_SWEEP_STEP_US);
-                }
-                rasterPhaseTicks = clockMicrosToCycles(rasterDelayUs);
-                osdDemoRasterClampPhaseToPeriod();
-            }
-        }
-
-        rasterFieldEpoch += period;
-        rasterEventCounter++;
-
-#ifdef USE_CLI
-        if (cliMode) {
-            (void)cliProcess();
-        }
-#endif
-        if (rasterMode == OSD_DEMO_RASTER_CAL) {
-            const timeUs_t t = micros();
-            const timeDelta_t uiUs = 1000000 / OSD_DEMO_SCROLL_HZ;
-            if ((int32_t)(t - lastStepUs) >= uiUs) {
-                lastStepUs = t;
-                osdDemoRasterCalAdvanceSweep();
-                osdDemoPaintRasterCal();
-                rasterStaticPainted = true;
-            }
-        }
     }
 }
 
 bool osdDemoStartPlasma2x2(void)
 {
-    if (ARMING_FLAG(ARMED)) {
-        return false;
-    }
-    if (!active) {
-        if (!osdDemoStart()) {
-            return false;
-        }
-    }
-    {
-        const osdDemoFx_e next = OSD_DEMO_FX_PLASMA2X2;
-        osdDemoEnterFx(next);
-    }
-    return true;
+    return osdDemoStartScene(7);
 }
 
-bool osdDemoStartHosTest(void) __attribute__((noinline));
+bool osdDemoStartTwister(void) __attribute__((noinline));
 
-bool osdDemoStartHosTest(void)
+bool osdDemoStartTwister(void)
 {
-    if (ARMING_FLAG(ARMED)) {
-        return false;
-    }
-    if (!active) {
-        if (!osdDemoStart()) {
-            return false;
-        }
-    }
-    // Already in the probe: allow `hostest line <n>` retarget without re-entering
-    // (EnginePoll may be the caller via cliProcess — must not nest MidGlyph/EnterFx).
-    if (fx == OSD_DEMO_FX_HOSTEST && hosTestArmed) {
-        return true;
-    }
-    // Explicit local so LTO cannot feed EnterFx a stale r0 (seen on this tree before).
-    const osdDemoFx_e next = OSD_DEMO_FX_HOSTEST;
-    osdDemoEnterFx(next);
-    return true;
-}
-
-void osdDemoHosTestSetLine(uint16_t lineFromRow0)
-{
-    // PAL active OSD ≈ 16*18 = 288 lines; clamp loosely for NTSC too.
-    if (lineFromRow0 > 400) {
-        lineFromRow0 = 400;
-    }
-    hosTestLine = lineFromRow0;
-}
-
-uint16_t osdDemoHosTestGetLine(void)
-{
-    return hosTestLine;
-}
-
-bool osdDemoStartRaster(uint8_t mode)
-{
-    if (mode > (uint8_t)OSD_DEMO_RASTER_FILL) {
-        mode = (uint8_t)OSD_DEMO_RASTER_GLYPH;
-    }
-    rasterMode = (osdDemoRasterMode_e)mode;
-    if (rasterMode == OSD_DEMO_RASTER_CAL) {
-        osdDemoRasterCalReset();
-    } else if (rasterMode == OSD_DEMO_RASTER_DIAG) {
-        osdDemoRasterApplyAutoPhase();
-    } else if (rasterMode == OSD_DEMO_RASTER_FILL) {
-        // Phase = top of character row 0 (VBLANK), not centre-cell.
-        // Extra SPI lead: full-row burst needs to start before the 2px band.
-        rasterPhaseAuto = true;
-        rasterDelayUs = OSD_DEMO_RASTER_VBLANK_US;
-        if (rasterDelayUs > OSD_DEMO_RASTER_DELAY_MAX_US) {
-            rasterDelayUs = OSD_DEMO_RASTER_DELAY_MAX_US;
-        }
-        rasterPhaseTicks = clockMicrosToCycles(rasterDelayUs);
-        osdDemoRasterClampPhaseToPeriod();
-        if (rasterSpiLeadUs < 40) {
-            rasterSpiLeadUs = 40;
-        }
-    } else if (rasterDelayUs == 0) {
-        rasterDelayUs = OSD_DEMO_RASTER_DEFAULT_PHASE_US;
-        rasterPhaseAuto = false;
-    }
-    if (rasterMode != OSD_DEMO_RASTER_MARK) {
-        markTestActive = false;
-    }
-    if (!active) {
-        if (!osdDemoStart()) {
-            return false;
-        }
-    }
-    osdDemoEnterFx(OSD_DEMO_FX_RASTER);
-    osdDemoRasterEngineInit();
-    return true;
-}
-
-void osdDemoRasterSetDelayUs(uint16_t delayUs)
-{
-    if (delayUs > OSD_DEMO_RASTER_DELAY_MAX_US) {
-        delayUs = OSD_DEMO_RASTER_DELAY_MAX_US;
-    }
-    rasterPhaseAuto = false;
-    rasterDelayUs = delayUs;
-    rasterPhaseTicks = clockMicrosToCycles(delayUs);
-    osdDemoRasterClampPhaseToPeriod();
-    if (rasterMode == OSD_DEMO_RASTER_SWEEP) {
-        rasterMode = OSD_DEMO_RASTER_GLYPH;
-    }
-    if (rasterMode == OSD_DEMO_RASTER_CAL) {
-        calCenterUs = delayUs;
-        calOffsetUs = 0;
-        osdDemoRasterCalSyncDynamic();
-        rasterStaticPainted = false;
-    }
-}
-
-void osdDemoRasterAdjustPeriodCorrectionTicks(int32_t deltaTicks)
-{
-    periodCorrectionTicks += deltaTicks;
-    periodCorrSeeded = true;
-    osdDemoRasterClampPeriodCorrection();
-    osdDemoRasterClampPhaseToPeriod();
-}
-
-void osdDemoRasterSetPeriodCorrectionTicks(int32_t ticks)
-{
-    periodCorrectionTicks = ticks;
-    periodCorrSeeded = true;
-    osdDemoRasterClampPeriodCorrection();
-    osdDemoRasterClampPhaseToPeriod();
-}
-
-void osdDemoRasterAdjustPhaseTicks(int32_t deltaTicks)
-{
-    rasterPhaseAuto = false;
-    int32_t ph = (int32_t)rasterPhaseTicks + deltaTicks;
-    if (ph < 0) {
-        ph = 0;
-    }
-    rasterPhaseTicks = (uint32_t)ph;
-    osdDemoRasterClampPhaseToPeriod();
-    rasterDelayUs = (uint16_t)clockCyclesToMicros((int32_t)rasterPhaseTicks);
-    if (rasterMode == OSD_DEMO_RASTER_CAL) {
-        calCenterUs = rasterDelayUs;
-        calOffsetUs = 0;
-        calDynamicUs = rasterDelayUs;
-    }
-}
-
-void osdDemoRasterSetPhaseTicks(uint32_t ticks)
-{
-    rasterPhaseTicks = ticks;
-    rasterPhaseAuto = false;
-    {
-        // Clamp + sync delay_us without re-clearing auto via AdjustPhaseTicks path noise.
-        osdDemoRasterClampPhaseToPeriod();
-        rasterDelayUs = (uint16_t)clockCyclesToMicros((int32_t)rasterPhaseTicks);
-        if (rasterMode == OSD_DEMO_RASTER_CAL) {
-            calCenterUs = rasterDelayUs;
-            calOffsetUs = 0;
-            calDynamicUs = rasterDelayUs;
-        }
-    }
-}
-
-void osdDemoRasterGetTiming(uint32_t *periodTicks, uint32_t *phaseTicks,
-                            uint32_t *timerHz, uint32_t *lateCount, uint32_t *maxLateTicks,
-                            int32_t *corrTicks)
-{
-    if (periodTicks) {
-        *periodTicks = osdDemoRasterEffectivePeriodTicks();
-    }
-    if (phaseTicks) {
-        *phaseTicks = rasterPhaseTicks;
-    }
-    if (timerHz) {
-        *timerHz = clockMicrosToCycles(1000000);
-    }
-    if (lateCount) {
-        *lateCount = rasterLateCount;
-    }
-    if (maxLateTicks) {
-        *maxLateTicks = rasterMaxLateTicks;
-    }
-    if (corrTicks) {
-        *corrTicks = periodCorrectionTicks;
-    }
-}
-
-void osdDemoRasterSetLineUs(uint16_t lineUs)
-{
-    if (lineUs < 50) {
-        lineUs = 50;
-    }
-    if (lineUs > 80) {
-        lineUs = 80;
-    }
-    rasterLineUs = lineUs;
-    if (rasterPhaseAuto) {
-        osdDemoRasterApplyAutoPhase();
-    }
-}
-
-void osdDemoRasterSetSpiLeadUs(uint16_t leadUs)
-{
-    if (leadUs > 200) {
-        leadUs = 200;
-    }
-    rasterSpiLeadUs = leadUs;
-}
-
-uint16_t osdDemoRasterGetSpiLeadUs(void)
-{
-    return rasterSpiLeadUs;
-}
-
-void osdDemoRasterGetVsyncStats(uint32_t *locks, uint32_t *timeouts, uint32_t *lastEdge)
-{
-    if (locks) {
-        *locks = vsyncLockCount;
-    }
-    if (timeouts) {
-        *timeouts = vsyncTimeoutCount;
-    }
-    if (lastEdge) {
-        *lastEdge = vsyncLastEdgeTicks;
-    }
-}
-
-uint32_t osdDemoRasterGetMeasuredLineTicks(void)
-{
-    return rasterMeasuredLineTicks;
-}
-
-void osdDemoRasterSetMarkInterval(uint16_t n)
-{
-    markInterval = n ? n : 1;
-}
-
-void osdDemoRasterSetMarkRepeat(bool enabled)
-{
-    markRepeat = enabled;
-}
-
-bool osdDemoRasterMarkStart(void)
-{
-    if (!osdDemoStartRaster((uint8_t)OSD_DEMO_RASTER_MARK)) {
-        return false;
-    }
-    rasterEventCounter = 0;
-    markLateEvents = 0;
-    markMaxLateTicks = 0;
-    markPairComplete = false;
-    markStartEvent = 0;
-    markEndEvent = 0;
-    markStartTick = 0;
-    markEndTick = 0;
-    markExpectedElapsedTicks = 0;
-    markElapsedErrorTicks = 0;
-    markErrorPerEventTicks = 0;
-    markTestActive = true;
-    rasterStaticPainted = false;
-    return true;
-}
-
-bool osdDemoRasterCalibrate(uint16_t n)
-{
-    osdDemoRasterSetMarkInterval(n ? n : OSD_DEMO_RASTER_MARK_INTERVAL_DEFAULT);
-    markRepeat = true;
-    return osdDemoRasterMarkStart();
-}
-
-void osdDemoRasterGetMarkStats(uint32_t *eventCount, uint16_t *interval, bool *repeat,
-                               bool *activeTest, bool *pairDone,
-                               uint32_t *startEvent, uint32_t *endEvent,
-                               uint32_t *startTick, uint32_t *endTick,
-                               uint32_t *expectedTicks, int32_t *elapsedErrorTicks,
-                               int32_t *errorPerEventTicks,
-                               uint32_t *markLate, uint32_t *markMaxLate)
-{
-    if (eventCount) {
-        *eventCount = rasterEventCounter;
-    }
-    if (interval) {
-        *interval = markInterval;
-    }
-    if (repeat) {
-        *repeat = markRepeat;
-    }
-    if (activeTest) {
-        *activeTest = markTestActive;
-    }
-    if (pairDone) {
-        *pairDone = markPairComplete;
-    }
-    if (startEvent) {
-        *startEvent = markStartEvent;
-    }
-    if (endEvent) {
-        *endEvent = markEndEvent;
-    }
-    if (startTick) {
-        *startTick = markStartTick;
-    }
-    if (endTick) {
-        *endTick = markEndTick;
-    }
-    if (expectedTicks) {
-        *expectedTicks = markExpectedElapsedTicks;
-    }
-    if (elapsedErrorTicks) {
-        *elapsedErrorTicks = markElapsedErrorTicks;
-    }
-    if (errorPerEventTicks) {
-        *errorPerEventTicks = markErrorPerEventTicks;
-    }
-    if (markLate) {
-        *markLate = markLateEvents;
-    }
-    if (markMaxLate) {
-        *markMaxLate = markMaxLateTicks;
-    }
-}
-
-void osdDemoRasterSetCell(uint8_t x, uint8_t y)
-{
-    rasterX = x;
-    rasterY = y;
-    if (rasterPhaseAuto) {
-        osdDemoRasterApplyAutoPhase();
-    }
-    if (active && fx == OSD_DEMO_FX_RASTER && rasterMode != OSD_DEMO_RASTER_CAL) {
-        rasterStaticPainted = false;
-        osdDemoPaintRaster();
-        max7456RefreshAll();
-        rasterStaticPainted = true;
-    }
-}
-
-void osdDemoRasterSetGlyphs(uint8_t glyphA, uint8_t glyphB)
-{
-    rasterGlyphA = glyphA;
-    rasterGlyphB = glyphB;
-    if (active && fx == OSD_DEMO_FX_RASTER && rasterMode != OSD_DEMO_RASTER_INVERT) {
-        rasterStaticPainted = false;
-        osdDemoPaintRaster();
-        max7456RefreshAll();
-        rasterStaticPainted = true;
-    }
-}
-
-void osdDemoRasterGetStatus(uint8_t *mode, uint8_t *x, uint8_t *y,
-                            uint16_t *delayUs, uint8_t *glyphA, uint8_t *glyphB)
-{
-    if (mode) {
-        *mode = (uint8_t)rasterMode;
-    }
-    if (x) {
-        *x = rasterX;
-    }
-    if (y) {
-        *y = rasterY;
-    }
-    if (delayUs) {
-        *delayUs = (rasterMode == OSD_DEMO_RASTER_CAL) ? calDynamicUs : rasterDelayUs;
-    }
-    if (glyphA) {
-        *glyphA = (rasterMode == OSD_DEMO_RASTER_INVERT) ? rasterInvGlyph : rasterGlyphA;
-    }
-    if (glyphB) {
-        *glyphB = rasterGlyphB;
-    }
+    return osdDemoStartScene(8);
 }
 
 bool osdDemoStart(void)
@@ -3655,6 +3716,7 @@ bool osdDemoStart(void)
     startLastError = NULL;
 
     if (active) {
+        fxHold = false; // `osd_demo` / `play` on a running demo: resume the auto-cycle
         return true;
     }
 
@@ -3742,6 +3804,7 @@ bool osdDemoStart(void)
     plasmaT = 0;
     memset(prevRowBright, 0xFF, sizeof(prevRowBright)); // force first shimmer write
     active = true;
+    fxHold = false;
     // Explicit local — LTO has reused a stale r0 for EnterFx on this tree before.
     {
         const osdDemoFx_e next = OSD_DEMO_FX_SCROLLER;
@@ -3751,9 +3814,6 @@ bool osdDemoStart(void)
     max7456FillScreen(OSD_DEMO_PIXEL_OFF);
     osdDemoPaintScroller();
     max7456RefreshAll();
-#ifdef USE_CHIPTUNE
-    chiptuneSchedulerPark();
-#endif
     return true;
 }
 
@@ -3768,9 +3828,8 @@ void osdDemoStop(void)
         return;
     }
     active = false;
-    rasterEngineArmed = false;
     plasma2x2Armed = false;
-    hosTestArmed = false;
+    twisterArmed = false;
     punchY = 0;
     punchVel = 0;
     max7456MidGlyphSpiEnd();
@@ -3786,9 +3845,64 @@ void osdDemoStop(void)
         displayClearScreen(demoDisplay, DISPLAY_CLEAR_WAIT);
         demoDisplay = NULL;
     }
-#ifdef USE_CHIPTUNE
-    chiptuneSchedulerUnpark();
-#endif
+}
+
+static timeMs_t osdDemoFxDurationMs(osdDemoFx_e f)
+{
+    switch (f) {
+    case OSD_DEMO_FX_SCROLLER:  return OSD_DEMO_FX_SCROLLER_MS;
+    case OSD_DEMO_FX_PLASMA:    return OSD_DEMO_FX_PLASMA_MS;
+    case OSD_DEMO_FX_FIRE:      return OSD_DEMO_FX_FIRE_MS;
+    case OSD_DEMO_FX_WIPE:      return OSD_DEMO_FX_WIPE_MS;
+    case OSD_DEMO_FX_TUNNEL:    return OSD_DEMO_FX_TUNNEL_MS;
+    case OSD_DEMO_FX_PLASMA2X2: return OSD_DEMO_FX_PLASMA2X2_MS;
+    case OSD_DEMO_FX_TWISTER:   return OSD_DEMO_FX_TWISTER_MS;
+    default:                    return OSD_DEMO_FX_SCROLLER_MS;
+    }
+}
+
+// Auto-cycle order: 1 scroller → 2 plasma → 3 fire → 4 wipe → 5 tunnel → 7 plasma 2×2 →
+// 8 twister → back to 1.
+static osdDemoFx_e osdDemoFxNext(osdDemoFx_e f)
+{
+    switch (f) {
+    case OSD_DEMO_FX_SCROLLER:  return OSD_DEMO_FX_PLASMA;
+    case OSD_DEMO_FX_PLASMA:    return OSD_DEMO_FX_FIRE;
+    case OSD_DEMO_FX_FIRE:      return OSD_DEMO_FX_WIPE;
+    case OSD_DEMO_FX_WIPE:      return OSD_DEMO_FX_TUNNEL;
+    case OSD_DEMO_FX_TUNNEL:    return OSD_DEMO_FX_PLASMA2X2;
+    case OSD_DEMO_FX_PLASMA2X2: return OSD_DEMO_FX_TWISTER;
+    default:                    return OSD_DEMO_FX_SCROLLER;
+    }
+}
+
+// CLI: run one scene permanently (1..5, 7, 8). Starts the demo if needed.
+bool osdDemoStartScene(uint8_t scene)
+{
+    static const int8_t sceneFx[9] = {
+        -1, OSD_DEMO_FX_SCROLLER, OSD_DEMO_FX_PLASMA, OSD_DEMO_FX_FIRE, OSD_DEMO_FX_WIPE,
+        OSD_DEMO_FX_TUNNEL, -1, OSD_DEMO_FX_PLASMA2X2, OSD_DEMO_FX_TWISTER,
+    };
+    if (scene >= ARRAYLEN(sceneFx) || sceneFx[scene] < 0) {
+        startLastError = "unknown scene (1..5, 7, 8)";
+        return false;
+    }
+    if (ARMING_FLAG(ARMED)) {
+        startLastError = "disarm first";
+        return false;
+    }
+    if (!active && !osdDemoStart()) {
+        return false;
+    }
+    fxHold = true;
+    const osdDemoFx_e next = (osdDemoFx_e)sceneFx[scene];
+    // Already running (re-issued from cliProcess inside the engine loop): just hold it.
+    if (fx == next && ((next == OSD_DEMO_FX_TWISTER && twisterArmed)
+                       || (next == OSD_DEMO_FX_PLASMA2X2 && plasma2x2Armed))) {
+        return true;
+    }
+    osdDemoEnterFx(next);
+    return true;
 }
 
 bool osdDemoIsActive(void)
@@ -3807,68 +3921,22 @@ void osdDemoUpdate(timeUs_t currentTimeUs)
     // the heartbeat "reinited" flag instead of OSD_DEMO_FX_SCROLLER).
     const timeMs_t nowMs = millis();
     const timeMs_t elapsed = nowMs - fxStartMs;
-    if (fx == OSD_DEMO_FX_SCROLLER) {
-        if (elapsed >= OSD_DEMO_FX_SCROLLER_MS) {
-            const osdDemoFx_e next = OSD_DEMO_FX_PLASMA;
+    const timeMs_t fxMs = osdDemoFxDurationMs(fx);
+    if (elapsed >= fxMs) {
+        if (!fxHold) {
+            const osdDemoFx_e next = osdDemoFxNext(fx);
             osdDemoEnterFx(next);
             return;
         }
-    } else if (fx == OSD_DEMO_FX_PLASMA) {
-        if (elapsed >= OSD_DEMO_FX_PLASMA_MS) {
-            const osdDemoFx_e next = OSD_DEMO_FX_FIRE;
-            osdDemoEnterFx(next);
+        // Held: mid-glyph engines run continuously; time-phased scenes loop on themselves.
+        if (fx != OSD_DEMO_FX_PLASMA2X2 && fx != OSD_DEMO_FX_TWISTER) {
+            const osdDemoFx_e same = fx;
+            osdDemoEnterFx(same);
             return;
         }
-    } else if (fx == OSD_DEMO_FX_FIRE) {
-        if (elapsed >= OSD_DEMO_FX_FIRE_MS) {
-            const osdDemoFx_e next = OSD_DEMO_FX_WIPE;
-            osdDemoEnterFx(next);
-            return;
-        }
-    } else if (fx == OSD_DEMO_FX_WIPE) {
-        if (elapsed >= OSD_DEMO_FX_WIPE_MS) {
-            const osdDemoFx_e next = OSD_DEMO_FX_TUNNEL;
-            osdDemoEnterFx(next);
-            return;
-        }
-    } else if (fx == OSD_DEMO_FX_TUNNEL) {
-        if (elapsed >= OSD_DEMO_FX_TUNNEL_MS) {
-            const osdDemoFx_e next = OSD_DEMO_FX_PLASMA2X2;
-            osdDemoEnterFx(next);
-            return;
-        }
-    } else if (fx == OSD_DEMO_FX_PLASMA2X2) {
-        if (elapsed >= OSD_DEMO_FX_PLASMA2X2_MS) {
-            const osdDemoFx_e next = OSD_DEMO_FX_SCROLLER;
-            osdDemoEnterFx(next);
-            return;
-        }
-    } else if (fx == OSD_DEMO_FX_RASTER || fx == OSD_DEMO_FX_HOSTEST) {
-        // Hold forever until CLI stop / mode change — never auto-cycle.
     }
 
-    // Raster / 2×2 plasma / HOS probe use DWT+VSYNC engines — poll every heartbeat.
-    if (fx == OSD_DEMO_FX_RASTER) {
-        if (ARMING_FLAG(ARMED)) {
-            osdDemoStop();
-            return;
-        }
-        osdDemoRasterEnginePoll();
-        if (rasterMode == OSD_DEMO_RASTER_CAL) {
-            // UI refresh ~SCROLL_HZ; engine already polled above.
-            const timeDelta_t uiUs = 1000000 / OSD_DEMO_SCROLL_HZ;
-            if ((int32_t)(currentTimeUs - lastStepUs) >= uiUs) {
-                lastStepUs = currentTimeUs;
-                osdDemoRasterCalAdvanceSweep();
-                osdDemoPaintRasterCal();
-                rasterStaticPainted = true;
-            }
-        } else if (!rasterStaticPainted) {
-            osdDemoPaintRaster();
-            rasterStaticPainted = true;
-        }
-        return;
-    }
+    // 2×2 plasma / twister use DWT+VSYNC engines — poll every heartbeat.
     if (fx == OSD_DEMO_FX_PLASMA2X2) {
         if (ARMING_FLAG(ARMED)) {
             osdDemoStop();
@@ -3877,12 +3945,12 @@ void osdDemoUpdate(timeUs_t currentTimeUs)
         osdDemoPlasma2x2EnginePoll();
         return;
     }
-    if (fx == OSD_DEMO_FX_HOSTEST) {
+    if (fx == OSD_DEMO_FX_TWISTER) {
         if (ARMING_FLAG(ARMED)) {
             osdDemoStop();
             return;
         }
-        osdDemoHosTestEnginePoll();
+        osdDemoTwisterEnginePoll();
         return;
     }
 
@@ -3906,9 +3974,6 @@ void osdDemoUpdate(timeUs_t currentTimeUs)
     // 1) Build the next frame in CPU shadow first (tunnel/plasma are heavy).
     // 2) Then VSYNC + SPI immediately — never burn blanking on paint math, or
     //    the beam slices the tunnel text band (strobe / pixel jitter).
-#ifdef USE_CHIPTUNE
-    beeperPwmAyFifoFill();
-#endif
     osdDemoAdvanceHosAndStars();
 
     if (fx == OSD_DEMO_FX_PLASMA) {
@@ -3924,9 +3989,6 @@ void osdDemoUpdate(timeUs_t currentTimeUs)
         osdDemoPaintScroller();
     }
 
-#ifdef USE_CHIPTUNE
-    beeperPwmAyFifoFill();
-#endif
     // Soft-scroll (no wrap): early HOS. Wrap: HOS stays deferred until pass end.
     osdDemoSyncFlush(true, true);
 }

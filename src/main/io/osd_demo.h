@@ -34,50 +34,51 @@ void osdDemoStop(void);
 bool osdDemoIsActive(void);
 void osdDemoUpdate(timeUs_t currentTimeUs);
 
+// Run one scene permanently, no auto-cycle: 1 scroller, 2 plasma, 3 fire, 4 wipe, 5 tunnel,
+// 7 plasma 2×2, 8 twister. `osd_demo` / `play` returns to the cycle.
+bool osdDemoStartScene(uint8_t scene);
 bool osdDemoStartPlasma2x2(void); // scene 7 — 2×2 mid-glyph plasma
-// Mid-scanline HOS poke: vertical white bar, HOS=32 → HOS=40 at mid of one line.
-// Tests whether HOS is realtime / next-line / next-field (Display timing only).
-bool osdDemoStartHosTest(void);
-void osdDemoHosTestSetLine(uint16_t lineFromRow0);
-uint16_t osdDemoHosTestGetLine(void);
-bool osdDemoStartRaster(uint8_t mode);
-void osdDemoRasterSetDelayUs(uint16_t delayUs);
-void osdDemoRasterSetCell(uint8_t x, uint8_t y);
-void osdDemoRasterSetGlyphs(uint8_t glyphA, uint8_t glyphB);
-void osdDemoRasterGetStatus(uint8_t *mode, uint8_t *x, uint8_t *y,
-                            uint16_t *delayUs, uint8_t *glyphA, uint8_t *glyphB);
-void osdDemoRasterCalEvent(uint8_t event);
-void osdDemoRasterCalGet(uint16_t *centerUs, uint16_t *rangeUs, uint16_t *dynamicUs);
-
-// Tick-based PAL software oscillator (DWT CYCCNT).
-// Nominal period is fixed (2160000 ticks @ 108 MHz). Only fine periodCorrection
-// is tunable. A/B SPI fires on deterministic DWT deadlines inside the engine loop.
-void osdDemoRasterAdjustPeriodCorrectionTicks(int32_t deltaTicks);
-void osdDemoRasterSetPeriodCorrectionTicks(int32_t ticks);
-void osdDemoRasterAdjustPhaseTicks(int32_t deltaTicks);
-void osdDemoRasterSetPhaseTicks(uint32_t ticks);
-void osdDemoRasterGetTiming(uint32_t *periodTicks, uint32_t *phaseTicks,
-                            uint32_t *timerHz, uint32_t *lateCount, uint32_t *maxLateTicks,
-                            int32_t *corrTicks);
-
-void osdDemoRasterSetMarkInterval(uint16_t n);
-void osdDemoRasterSetMarkRepeat(bool enabled);
-bool osdDemoRasterMarkStart(void);
-bool osdDemoRasterCalibrate(uint16_t n);
-void osdDemoRasterGetMarkStats(uint32_t *eventCount, uint16_t *interval, bool *repeat,
-                               bool *activeTest, bool *pairDone,
-                               uint32_t *startEvent, uint32_t *endEvent,
-                               uint32_t *startTick, uint32_t *endTick,
-                               uint32_t *expectedTicks, int32_t *elapsedErrorTicks,
-                               int32_t *errorPerEventTicks,
-                               uint32_t *markLate, uint32_t *markMaxLate);
-void osdDemoRasterGetVsyncStats(uint32_t *locks, uint32_t *timeouts, uint32_t *lastEdge);
-uint32_t osdDemoRasterGetMeasuredLineTicks(void);
-void osdDemoRasterSetLineUs(uint16_t lineUs);
-void osdDemoRasterSetSpiLeadUs(uint16_t leadUs);
-uint16_t osdDemoRasterGetSpiLeadUs(void);
-uint16_t osdDemoRasterComputeCellTopPhaseUs(void);
-uint16_t osdDemoRasterComputeCellTopLine(void);
-uint16_t osdDemoRasterApplyAutoPhase(void);
-
+// Scene 8 — classic vertical B/W ribbon twister (glyph width + HOS sway).
+bool osdDemoStartTwister(void);
+typedef struct osdDemoTwisterStats_s {
+    uint32_t fields;
+    uint32_t writes;       // bands actually sent (dirty cells only)
+    uint32_t skips;        // bands dropped because the burst could not finish before the beam
+    uint16_t maxBytes;     // largest single SPI burst
+    uint32_t lineQ16;      // measured line period, DWT ticks << 16
+    uint32_t byteTicksQ8;  // learned SPI cost per byte, DWT ticks << 8
+    uint32_t cyclesPerUs;
+    uint16_t skipRow[16];  // skips per character row — shows where on screen bands are lost
+    uint32_t fieldTicks;   // last raw VSYNC→VSYNC
+    uint32_t idleTicks;    // total wait-for-beam ticks since last reset
+    uint32_t bytes;        // total SPI bytes of all bursts since last reset
+    int32_t phaseField1;   // HSYNC phase vs model, field 1 (ticks)
+    int32_t phaseField2;   // same, field 2 — expect ~½ line apart
+    uint32_t slowBursts;   // bursts stretched by an IRQ (ignored by the SPI cost learner)
+    uint32_t fieldReject;  // fields outside ±0.5% of 20 ms (not used for line period)
+    uint32_t hsyncMiss;
+    bool hsyncLock;
+    int32_t rowCorrTicks[16]; // measured beam phase per char row vs row 1
+} osdDemoTwisterStats_t;
+void osdDemoTwisterGetStats(osdDemoTwisterStats_t *st, bool reset);
+// Scene 8 timing model: lines per field ×2 (624/625/626) and a constant write shift (us).
+void osdDemoTwisterSetFieldHalfLines(uint16_t halfLines);
+uint16_t osdDemoTwisterGetFieldHalfLines(void);
+// Interlace pairing: 0/1 = advance once per frame on even/odd field, 2 = every field.
+// HSYNC re-lock once per char row (default on).
+void osdDemoTwisterSetHsyncLock(bool enable);
+bool osdDemoTwisterGetHsyncLock(void);
+void osdDemoTwisterSetPair(uint8_t mode);
+uint8_t osdDemoTwisterGetPair(void);
+// Timing ruler instead of the twister (zig-zag bar, 1.67 px/line).
+void osdDemoTwisterSetTest(bool zigzag);
+bool osdDemoTwisterGetTest(void);
+void osdDemoTwisterSetFreeze(bool freeze);
+bool osdDemoTwisterGetFreeze(void);
+void osdDemoTwisterGetPhases(uint8_t *rot, uint8_t *bendA, uint8_t *bendB);
+// Scene 7 race-the-beam: HSYNC edge → first OSD pixel (us), tunable live.
+void osdDemoMgSetBeamX0Us(int16_t us);
+int16_t osdDemoMgGetBeamX0Us(void);
+void osdDemoTwisterSetShiftUs(int16_t us);
+int16_t osdDemoTwisterGetShiftUs(void);
 #endif

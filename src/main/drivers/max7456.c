@@ -43,10 +43,6 @@
 #include "drivers/system.h"
 #include "drivers/time.h"
 
-#ifdef USE_CHIPTUNE
-#include "drivers/sound_beeper.h"
-#endif
-
 // 10 MHz max SPI frequency
 #define MAX7456_MAX_SPI_CLK_HZ 10000000
 #define MAX7456_INIT_MAX_SPI_CLK_HZ 5000000
@@ -406,7 +402,6 @@ static void max7456ReInit(void)
     // Re-enable MAX7456 (last function call disables it)
 
     // Make sure the Max7456 is enabled
-    videoSignalReg |= SYNC_MODE_INTERNAL;
     spiWriteReg(dev, MAX7456ADD_VM0, videoSignalReg);
     // Reinit restores configured base position; drop any transient HUD offset.
     max7456ResetHudMotionOffset();
@@ -473,8 +468,15 @@ max7456InitStatus_e max7456Init(const max7456Config_t *max7456Config, const vcdP
     uint8_t osdm = spiReadRegMsk(dev, MAX7456ADD_OSDM);
 
     if (osdm != 0x1B) {
-        // One retry after a second END_STRING (bus may still have been mid-frame).
+        // The chip keeps power across FC reflash / soft reboot, so it can still be inside
+        // an auto-increment session (16-bit framed or 8-bit data-only, datasheet p.29) and
+        // eat every register write. Escape in both framings, then VM0[1] software reset
+        // (all registers to defaults, display memory cleared, ~100 us; p.25).
         spiWrite(dev, END_STRING);
+        spiWriteReg(dev, MAX7456ADD_DMDI, END_STRING);
+        spiWrite(dev, END_STRING);
+        spiWriteReg(dev, MAX7456ADD_VM0, MAX7456_RESET);
+        delayMicroseconds(1000);
         spiWriteReg(dev, MAX7456ADD_OSDM, 0x1B);
         osdm = spiReadRegMsk(dev, MAX7456ADD_OSDM);
     }
@@ -1026,9 +1028,6 @@ static bool max7456WaitSpiIdle(void)
     // Finish any in-flight DMA segment before stealing the bus.
     timeUs_t spinStart = micros();
     while (max7456ActiveDma || spiIsBusy(dev)) {
-#ifdef USE_CHIPTUNE
-        beeperPwmAyFifoFill();
-#endif
         if (cmpTimeUs(micros(), spinStart) > 5000) {
             return false;
         }
@@ -1169,8 +1168,10 @@ static bool midGlyphSavedDma;
 // after END — keeps the odd-line tear window under ~24 us @20 MHz / 30 cells.
 // invs==NULL → all cells non-inverted. Otherwise invs[i]!=0 sets per-cell INV via DMM[3]
 // (16-bit mode copies DMM INV into each written character). Runs are grouped by INV.
-bool max7456WriteDisplaySramRowGlyphsInv(uint16_t addr, const uint8_t *glyphs, const uint8_t *invs,
-                                         uint8_t count, bool commitShadow)
+// hosAbsOrNull: when non-NULL, prepend MAX7456ADD_HOS|*hos in the SAME spiSequence and
+// update hosRegValue/previousHosRegister (one CS, no second wait).
+static bool max7456WriteDisplaySramRowGlyphsInvEx(uint16_t addr, const uint8_t *glyphs, const uint8_t *invs,
+                                                  uint8_t count, bool commitShadow, const uint8_t *hosAbsOrNull)
 {
     if (!glyphs || count == 0 || addr >= maxScreenSize) {
         return false;
@@ -1197,9 +1198,19 @@ bool max7456WriteDisplaySramRowGlyphsInv(uint16_t addr, const uint8_t *glyphs, c
         }
     }
 
-    // Worst case: INV alternates every cell → count short runs. ~10 bytes/run.
+    // Worst case: INV alternates every cell → count short runs. ~10 bytes/run. +2 for HOS.
     static DMA_DATA uint8_t rowGlyphBuf[512];
     uint16_t idx = 0;
+    if (hosAbsOrNull) {
+        uint8_t hos = *hosAbsOrNull;
+        if (hos > 63) {
+            hos = 63;
+        }
+        hosRegValue = hos;
+        previousHosRegister = hos;
+        rowGlyphBuf[idx++] = MAX7456ADD_HOS;
+        rowGlyphBuf[idx++] = hos;
+    }
     uint8_t i = 0;
     while (i < count) {
         const bool runInv = invs ? (invs[i] != 0) : false;
@@ -1268,9 +1279,163 @@ bool max7456WriteDisplaySramRowGlyphsInv(uint16_t addr, const uint8_t *glyphs, c
     return true;
 }
 
+bool max7456WriteDisplaySramRowGlyphsInv(uint16_t addr, const uint8_t *glyphs, const uint8_t *invs,
+                                         uint8_t count, bool commitShadow)
+{
+    return max7456WriteDisplaySramRowGlyphsInvEx(addr, glyphs, invs, count, commitShadow, NULL);
+}
+
 bool max7456WriteDisplaySramRowGlyphs(uint16_t addr, const uint8_t *glyphs, uint8_t count, bool commitShadow)
 {
-    return max7456WriteDisplaySramRowGlyphsInv(addr, glyphs, NULL, count, commitShadow);
+    return max7456WriteDisplaySramRowGlyphsInvEx(addr, glyphs, NULL, count, commitShadow, NULL);
+}
+
+bool max7456WriteHosSignedAndRowGlyphs(int8_t offsetPx, uint16_t addr, const uint8_t *glyphs,
+                                       uint8_t count, bool commitShadow)
+{
+    int hos = 32 + (int)offsetPx;
+    if (hos < 0) {
+        hos = 0;
+    }
+    if (hos > 63) {
+        hos = 63;
+    }
+    const uint8_t hosAbs = (uint8_t)hos;
+    return max7456WriteDisplaySramRowGlyphsInvEx(addr, glyphs, NULL, count, commitShadow, &hosAbs);
+}
+
+#if defined(STM32F4)
+// Mid-glyph hot path, write-only. The generic polled transfer sends a byte, waits for its
+// RX byte, reads it, and does it through stdperiph flag calls — ~1.25 us/byte at 13.5 MHz
+// where the wire needs 0.59 us. Writes to the MAX7456 return nothing useful, so keep TXE
+// fed back-to-back and drop RX once at the end (DR then SR read clears OVR).
+// Only used when the bus already carries this device's clock/mode (the generic path
+// applies a pending divisor change lazily) — otherwise fall back.
+static bool max7456SpiTxOnlyBurst(const uint8_t *buf, uint16_t len)
+{
+    busDevice_t *bus = dev->bus;
+    if (dev->busType_u.spi.speed != bus->busType_u.spi.speed
+        || dev->busType_u.spi.leadingEdge != bus->busType_u.spi.leadingEdge) {
+        return false;
+    }
+    SPI_TypeDef *spi = (SPI_TypeDef *)bus->busType_u.spi.instance;
+    IOLo(dev->busType_u.spi.csnPin);
+    for (uint16_t i = 0; i < len; i++) {
+        while (!(spi->SR & SPI_SR_TXE)) {
+        }
+        *(volatile uint8_t *)&spi->DR = buf[i];
+    }
+    while (!(spi->SR & SPI_SR_TXE)) {
+    }
+    while (spi->SR & SPI_SR_BSY) {
+    }
+    (void)spi->DR;
+    (void)spi->SR;
+    IOHi(dev->busType_u.spi.csnPin);
+    return true;
+}
+#endif
+
+static DMA_DATA uint8_t midGlyphRowBuf[256];
+
+// Mid-glyph hot path: encode one row burst from a segment plan. Two framings, both 16-bit:
+//  - autoInc: DMM|AI, [DMAH], DMAL, (DMDI,ca)×n, (DMDI,0xFF)   = 6 (+2) + 2n bytes
+//  - single:  [DMM non-AI], [DMAH], DMAL, (DMDI,ca) per cell  = 4 (+2) bytes per cell
+// Isolated changed cells are far cheaper as plain addressed writes than as an AI run, and
+// nothing unchanged gets rewritten (fewer SRAM writes → fewer internal-read collisions,
+// datasheet p.40). DMAH is only sent when address bit 8 changes. segLastByte[i] = offset just
+// past the last character byte of segment i (when that cell lands) for beam racing.
+// The datasheet's 8-bit data-only AI framing (Fig. 21) hangs AT7456 clones — not used.
+uint16_t max7456EncodeDisplaySramRow(uint16_t rowAddr, const uint8_t *glyphs,
+                                     const max7456SramSeg_t *seg, uint8_t nSeg, uint16_t *segLastByte)
+{
+    const uint8_t dmmAi = (uint8_t)((displayMemoryModeReg & (uint8_t)~INVERT_PIXEL_COLOR) | DMM_AUTO_INC);
+    const uint8_t dmmSingle = (uint8_t)(dmmAi & (uint8_t)~DMM_AUTO_INC);
+    uint16_t idx = 0;
+    bool dmmSingleKnown = false;
+    int16_t high = -1; // DMAH bit 8 currently in the chip, -1 = unknown
+    for (uint8_t i = 0; i < nSeg; i++) {
+        const uint16_t addr = (uint16_t)(rowAddr + seg[i].col);
+        uint8_t len = seg[i].len;
+        if (len == 0 || addr >= maxScreenSize) {
+            segLastByte[i] = idx;
+            continue;
+        }
+        if ((uint16_t)(addr + len) > maxScreenSize) {
+            len = (uint8_t)(maxScreenSize - addr);
+        }
+        const uint16_t need = (uint16_t)(seg[i].autoInc ? 10u + 2u * len : 8u + 6u * len);
+        if ((uint16_t)(idx + need) > sizeof(midGlyphRowBuf)) {
+            return 0;
+        }
+        if (seg[i].autoInc) {
+            midGlyphRowBuf[idx++] = MAX7456ADD_DMM;
+            midGlyphRowBuf[idx++] = dmmAi;
+            if (high != (int16_t)(addr >> 8)) {
+                midGlyphRowBuf[idx++] = MAX7456ADD_DMAH;
+                midGlyphRowBuf[idx++] = (uint8_t)((addr >> 8) & 0x01);
+                high = (int16_t)(addr >> 8);
+            }
+            midGlyphRowBuf[idx++] = MAX7456ADD_DMAL;
+            midGlyphRowBuf[idx++] = (uint8_t)(addr & 0xff);
+            for (uint8_t k = 0; k < len; k++) {
+                midGlyphRowBuf[idx++] = MAX7456ADD_DMDI;
+                midGlyphRowBuf[idx++] = glyphs[seg[i].col + k];
+            }
+            segLastByte[i] = idx;
+            midGlyphRowBuf[idx++] = MAX7456ADD_DMDI;
+            midGlyphRowBuf[idx++] = END_STRING;
+            dmmSingleKnown = false;
+            if ((addr >> 8) != ((addr + len - 1u) >> 8)) {
+                high = -1; // the AI counter crossed 255→256; chip DMAH state unknown
+            }
+        } else {
+            if (!dmmSingleKnown) {
+                midGlyphRowBuf[idx++] = MAX7456ADD_DMM;
+                midGlyphRowBuf[idx++] = dmmSingle;
+                dmmSingleKnown = true;
+            }
+            for (uint8_t k = 0; k < len; k++) {
+                const uint16_t a = (uint16_t)(addr + k);
+                if (high != (int16_t)(a >> 8)) {
+                    midGlyphRowBuf[idx++] = MAX7456ADD_DMAH;
+                    midGlyphRowBuf[idx++] = (uint8_t)((a >> 8) & 0x01);
+                    high = (int16_t)(a >> 8);
+                }
+                midGlyphRowBuf[idx++] = MAX7456ADD_DMAL;
+                midGlyphRowBuf[idx++] = (uint8_t)(a & 0xff);
+                midGlyphRowBuf[idx++] = MAX7456ADD_DMDI;
+                midGlyphRowBuf[idx++] = glyphs[seg[i].col + k];
+            }
+            segLastByte[i] = idx;
+        }
+    }
+    return idx;
+}
+
+// Send what max7456EncodeDisplaySramRow() prepared. Only valid between MidGlyphSpiBegin/End.
+bool max7456SendEncodedDisplaySram(uint16_t len)
+{
+    if (!midGlyphSpiHot || len == 0 || len > sizeof(midGlyphRowBuf)) {
+        return false;
+    }
+    if (max7456ActiveDma || spiIsBusy(dev)) {
+        if (!max7456WaitSpiIdle()) {
+            return false;
+        }
+    }
+#if defined(STM32F4)
+    if (max7456SpiTxOnlyBurst(midGlyphRowBuf, len)) {
+        return true;
+    }
+#endif
+    busSegment_t segments[] = {
+        {.u.buffers = {midGlyphRowBuf, NULL}, len, true, NULL},
+        {.u.link = {NULL, NULL}, 0, true, NULL},
+    };
+    spiSequence(dev, &segments[0]);
+    spiWait(dev);
+    return true;
 }
 
 void max7456MidGlyphSpiBegin(void)
@@ -1309,6 +1474,14 @@ void max7456MidGlyphSpiBoost(bool enable)
     if (enable) {
         // 20 MHz for both AT and MAX — needed to finish a row rewrite inside a PAL line.
         spiSetClkDivisor(dev, spiCalculateDivider(MAX7456_MAX_SPI_CLK_HZ * 2));
+        // The bus layer applies a divisor lazily on the next spiSequence. Latch it now with a
+        // write that cannot touch the picture (~1 us) so the first hot burst after a STAT poll
+        // takes the TX-only path instead of the 2× slower generic one. DMAH only feeds the
+        // next display-memory address, and every hot burst rewrites it first — unlike HOS,
+        // which re-latches the horizontal position mid-line.
+        if (!max7456ActiveDma && !spiIsBusy(dev)) {
+            spiWriteReg(dev, MAX7456ADD_DMAH, 0);
+        }
     } else {
         spiSetClkDivisor(dev, midGlyphSavedDiv);
     }
@@ -1326,8 +1499,23 @@ void max7456WriteHosNow(uint8_t hos)
     } else if (spiIsBusy(dev)) {
         spiWait(dev);
     }
+    // Keep hosRegValue in sync so a later ApplyHosVos cannot snap by ~1 cell.
+    hosRegValue = hos;
     previousHosRegister = hos;
     spiWriteReg(dev, MAX7456ADD_HOS, hos);
+}
+
+void max7456WriteHosSigned(int8_t offsetPx)
+{
+    // Register center 32 == neutral. Clamp BEFORE encode — never wrap 0↔63.
+    int hos = 32 + (int)offsetPx;
+    if (hos < 0) {
+        hos = 0;
+    }
+    if (hos > 63) {
+        hos = 63;
+    }
+    max7456WriteHosNow((uint8_t)hos);
 }
 
 void max7456CommitShadowCell(uint16_t addr, uint8_t glyph, bool invert)
@@ -1360,9 +1548,6 @@ bool max7456WaitVsyncFallingEdge(uint32_t *edgeTicks, timeUs_t timeoutUs)
 
     // Ensure we start from VSYNC high so the next 1→0 is a real edge.
     while (!STAT_IS_VSYNC_HIGH(prev)) {
-#ifdef USE_CHIPTUNE
-        beeperPwmAyFifoFill();
-#endif
         if (cmpTimeUs(micros(), t0) > (timeDelta_t)timeoutUs) {
             return false;
         }
@@ -1370,9 +1555,6 @@ bool max7456WaitVsyncFallingEdge(uint32_t *edgeTicks, timeUs_t timeoutUs)
     }
 
     for (;;) {
-#ifdef USE_CHIPTUNE
-        beeperPwmAyFifoFill();
-#endif
         const uint8_t s = spiReadRegMsk(dev, MAX7456ADD_STAT);
         if (STAT_IS_VSYNC_HIGH(prev) && !STAT_IS_VSYNC_HIGH(s)) {
             // Falling edge of STAT[4] ≈ start of VSYNC (active-low ~VSYNC).

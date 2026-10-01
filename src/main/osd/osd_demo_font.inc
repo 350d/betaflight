@@ -16,13 +16,6 @@
 #define OSD_DEMO_STREAK_BOT1   0xEF
 #define OSD_DEMO_STREAK_BOT2   0xF0
 #define OSD_DEMO_STREAK_TOP1   0xF1
-#define OSD_DEMO_STRIPE_BASE   0xF2  // FILL uses F7/FD: 2x1 diagonal hatch; F2-F6 DIAG cum 2x2
-#define OSD_DEMO_STRIPE_COUNT  12    // 6 cumulative steps × 2 vertical phases
-#define OSD_DEMO_DIAG_STEPS    6
-#define OSD_DEMO_DIAG_CUBE_PX  2
-#define OSD_DEMO_DIAG_PHASE1   6     // offset to odd-row phase glyphs
-#define OSD_DEMO_FILL_GLYPH_P0 0xF7  // full-cell 2x1 hatch (even char rows)
-#define OSD_DEMO_FILL_GLYPH_P1 0xFD  // full-cell 2x1 hatch (odd char rows)
 #define OSD_DEMO_PX22_BASE     0x40  // 64 solid 6-col masks for 2×2 mid-glyph plasma (hot path)
 #define OSD_DEMO_PX22_GLYPHS   64
 #define OSD_DEMO_PX22_COLS     6    // 12px / 2

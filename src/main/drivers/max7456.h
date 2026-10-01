@@ -80,6 +80,9 @@ void    max7456ApplyHudMotionNow(void);
 // Absolute HOS register poke (0..63). Display timing only — no Display SRAM / NVM.
 // Used by mid-scanline HOS realtime probes; updates the driver's HOS shadow.
 void    max7456WriteHosNow(uint8_t hos);
+// Signed pixel offset relative to register center 32. Clamps before encode — no wrap.
+// Accepts -32..+31 (+ = right on screen). Scene code must not invent "32 + x" itself.
+void    max7456WriteHosSigned(int8_t offsetPx);
 // Available HUD offset before HOS/VOS clamps ( +X = right, +Y = down on screen ).
 void    max7456GetHudMotionXLimits(int8_t *minX, int8_t *maxX);
 void    max7456GetHudMotionYLimits(int8_t *minY, int8_t *maxY);
@@ -106,6 +109,19 @@ bool    max7456WriteDisplaySramRowGlyphs(uint16_t addr, const uint8_t *glyphs, u
 // Same, with optional per-cell INV (NULL = all non-inverted). Groups runs by INV for 16-bit DMM copy.
 bool    max7456WriteDisplaySramRowGlyphsInv(uint16_t addr, const uint8_t *glyphs, const uint8_t *invs,
                                            uint8_t count, bool commitShadow);
+// One SPI burst: signed HOS (center=32) then row glyphs. Avoids a second transaction in the
+// mid-scanline tear window (twister HOS bend + silhouette rewrite).
+bool    max7456WriteHosSignedAndRowGlyphs(int8_t offsetPx, uint16_t addr, const uint8_t *glyphs,
+                                          uint8_t count, bool commitShadow);
+// Mid-glyph hot path: one row burst built from a segment plan (hot mode only).
+typedef struct max7456SramSeg_s {
+    uint8_t col;      // first column in the row
+    uint8_t len;      // cells
+    bool autoInc;     // true: one auto-increment run; false: addressed write per cell
+} max7456SramSeg_t;
+uint16_t max7456EncodeDisplaySramRow(uint16_t rowAddr, const uint8_t *glyphs,
+                                     const max7456SramSeg_t *seg, uint8_t nSeg, uint16_t *segLastByte);
+bool    max7456SendEncodedDisplaySram(uint16_t len);
 // Lock SPI for a mid-glyph field (20 MHz polled on AT, sticky DMM). Call End after the field.
 void    max7456MidGlyphSpiBegin(void);
 void    max7456MidGlyphSpiEnd(void);
