@@ -5023,6 +5023,510 @@ RAM_CODE static void cliChiptune(const char *cmdName, char *cmdline)
 
     cliPrintLine("usage: chiptune [play|stop|test [dwellMs]|dwell <ms>]");
 }
+
+#include "io/osd_demo.h"
+#include "drivers/max7456.h"
+
+RAM_CODE static void cliOsdDemo(const char *cmdName, char *cmdline)
+{
+    UNUSED(cmdName);
+
+    char *saveptr;
+    char *cmd = strtok_r(cmdline, " ", &saveptr);
+
+    if (!cmd || strcasecmp(cmd, "play") == 0 || strcasecmp(cmd, "start") == 0) {
+        if (ARMING_FLAG(ARMED)) {
+            cliPrintLine("osd_demo: disarm first");
+            return;
+        }
+        if (osdDemoStart()) {
+            cliPrintLine("osd_demo: demoscene cycle (glyphs @ 0x80+ hfill, 0xC0+ effects)");
+            cliPrintLine("  fx1 scroller: HOS soft-scroll, 18 fill+INV, VOS punch, stars");
+            cliPrintLine("  fx2 plasma: Craft 3-blob → 8 seamless dither glyphs");
+            cliPrintLine("  fx3 fire: heat rise, soft-fill ribbon, sparks, VOS lock");
+            cliPrintLine("  fx4 wipe: flat HFILL curtain (white over transparent video)");
+            cliPrintLine("  fx5 tunnel: Craft ray labyrinth");
+            cliPrintLine("  scene7: 2x2 mid-glyph plasma (64 solid PX22)");
+            cliPrintLine("  hostest: mid-scanline HOS 32→40 on vertical bar (timing probe)");
+            cliPrintLine("  raster … : Display SRAM mid-glyph probe (CLI-only)");
+        } else {
+            cliPrintLinef("osd_demo: failed — %s", osdDemoStartLastError());
+            cliPrintLine("  tip: feature enable OSD   then reboot, or power-cycle FC");
+        }
+        return;
+    }
+
+    if (strcasecmp(cmd, "stop") == 0) {
+        osdDemoStop();
+        cliPrintLine("osd_demo: stopped");
+        return;
+    }
+
+    // Scene 7 — 2×2 mid-glyph plasma (not a tunnel).
+    if (strcasecmp(cmd, "scene7") == 0 || strcasecmp(cmd, "plasma2x2") == 0) {
+        if (ARMING_FLAG(ARMED)) {
+            cliPrintLine("osd_demo: disarm first");
+            return;
+        }
+        if (osdDemoStartPlasma2x2()) {
+            cliPrintLine("osd_demo scene7: 2x2 mid-glyph plasma (64 solid PX22)");
+        } else {
+            cliPrintLinef("osd_demo scene7: failed — %s", osdDemoStartLastError());
+        }
+        return;
+    }
+
+    // Mid-scanline HOS poke — display timing only (no framebuffer rewrite after paint).
+    if (strcasecmp(cmd, "hostest") == 0 || strcasecmp(cmd, "hos") == 0
+        || strcasecmp(cmd, "hosshift") == 0) {
+        if (ARMING_FLAG(ARMED)) {
+            cliPrintLine("osd_demo: disarm first");
+            return;
+        }
+        char *arg = strtok_r(NULL, " ", &saveptr);
+        if (arg && (strcasecmp(arg, "line") == 0 || isdigit((unsigned char)arg[0]))) {
+            const char *val = (strcasecmp(arg, "line") == 0) ? strtok_r(NULL, " ", &saveptr) : arg;
+            if (!val) {
+                cliPrintLine("usage: osd_demo hostest [line <n>]  (scanline from OSD row0 top)");
+                return;
+            }
+            osdDemoHosTestSetLine((uint16_t)atoi(val));
+        }
+        if (!featureIsEnabled(FEATURE_OSD) && !featureIsConfigured(FEATURE_OSD)) {
+            cliPrintLine("osd_demo hostest: failed — feature OSD is OFF");
+            cliPrintLine("  run:  feature OSD");
+            cliPrintLine("        save");
+            cliPrintLine("  then reboot and retry osd_demo hostest");
+            return;
+        }
+        if (!featureIsEnabled(FEATURE_OSD) && featureIsConfigured(FEATURE_OSD)) {
+            cliPrintLine("osd_demo hostest: feature OSD configured but not active in runtime");
+            cliPrintLine("  save + reboot required after loading a preset");
+            return;
+        }
+        // Do not gate on IsDeviceDetected here — boot may have deferred NOT_FOUND.
+        // osdDemoStart() forces SPI rescan / raw max7456Init.
+        if (osdDemoStartHosTest()) {
+            cliPrintLine("osd_demo hostest: bar + corners; HOS 16↔32 (+16px)");
+            cliPrintLine("  4-field cycle: HOLD-A | HOLD-B | mid-poke | mid-poke");
+            cliPrintLinef("  mid-poke line=%u (OSD row0); bar must JUMP left/right on hold fields",
+                          (unsigned)osdDemoHosTestGetLine());
+            cliPrintLine("  readout: L↔R jump=HOS ok; mid kink=realtime; no kink but jump=field-latch");
+            cliPrintLine("  stop: osd_demo stop");
+        } else {
+            cliPrintLine("osd_demo hostest: failed — MAX7456 init/font after rescan");
+            cliPrintLinef("  runtimeOSD=%d configuredOSD=%d detected=%d dp=%d",
+                          featureIsEnabled(FEATURE_OSD) ? 1 : 0,
+                          featureIsConfigured(FEATURE_OSD) ? 1 : 0,
+                          max7456IsDeviceDetected() ? 1 : 0,
+                          osdGetDisplayPort(NULL) ? 1 : 0);
+            cliPrintLine("  reboot after preset; get osd_displayport_device; camera optional for detect");
+        }
+        return;
+    }
+
+    // Display SRAM mid-glyph probe (CLI-only, not in auto cycle).
+    if (strcasecmp(cmd, "raster") == 0) {
+        if (ARMING_FLAG(ARMED)) {
+            cliPrintLine("osd_demo raster: disarm first");
+            return;
+        }
+
+        char *arg = strtok_r(NULL, " ", &saveptr);
+        if (!arg || strcasecmp(arg, "glyph") == 0 || strcasecmp(arg, "start") == 0) {
+            if (osdDemoStartRaster(0)) {
+                cliPrintLine("osd_demo raster: GLYPH A->B (software period grid)");
+            } else {
+                cliPrintLine("osd_demo raster: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "vsync") == 0) {
+            if (osdDemoStartRaster(5)) {
+                cliPrintLine("osd_demo raster VSYNC: poll STAT[4] 1->0, DWT phase, A->B rewrite");
+                cliPrintLine("  no period corr — resync every PAL field from MAX7456");
+                cliPrintLinef("  phase=%u us — tune with: osd_demo raster phase <us>",
+                              (unsigned)16512);
+            } else {
+                cliPrintLine("osd_demo raster: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "diag") == 0 || strcasecmp(arg, "diagonal") == 0) {
+            if (osdDemoStartRaster(6)) {
+                const uint16_t ph = osdDemoRasterComputeCellTopPhaseUs();
+                cliPrintLine("osd_demo raster DIAG: VSYNC + dense 2px diagonal hatch");
+                cliPrintLine("  ##../..## cumulative; odd/even char-row phase + 1/2 line");
+                cliPrintLinef("  phase=auto %u us; lead=%u us", ph, osdDemoRasterGetSpiLeadUs());
+            } else {
+                cliPrintLine("osd_demo raster: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "fill") == 0) {
+            if (osdDemoStartRaster(7)) {
+                cliPrintLine("osd_demo raster FILL: whole screen mid-glyph diagonal hatch");
+                cliPrintLine("  every char row: 6 steps x 2 lines; SPI row burst");
+                cliPrintLinef("  phase=row0 %u us (vblank); lead=%u us",
+                              (unsigned)1504, osdDemoRasterGetSpiLeadUs());
+                cliPrintLine("  tune: phase N (row0), line_us 64, lead 24");
+            } else {
+                cliPrintLine("osd_demo raster: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "lead") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            if (!val) {
+                cliPrintLinef("lead=%u us  (SPI write-early; safe with cumulative glyphs)",
+                              osdDemoRasterGetSpiLeadUs());
+                cliPrintLine("usage: osd_demo raster lead <us>  (0..200, default 24)");
+                return;
+            }
+            {
+                int v = atoi(val);
+                if (v < 0) {
+                    v = 0;
+                }
+                if (v > 200) {
+                    v = 200;
+                }
+                osdDemoRasterSetSpiLeadUs((uint16_t)v);
+                cliPrintLinef("lead=%d us", v);
+            }
+            return;
+        }
+        if (strcasecmp(arg, "line_us") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            if (!val) {
+                cliPrintLine("usage: osd_demo raster line_us <us>  (PAL line ~64)");
+                return;
+            }
+            {
+                int v = atoi(val);
+                if (v < 50) {
+                    v = 50;
+                }
+                if (v > 80) {
+                    v = 80;
+                }
+                osdDemoRasterSetLineUs((uint16_t)v);
+                cliPrintLinef("line_us=%d (fallback before first VSYNC measure)", v);
+            }
+            return;
+        }
+        if (strcasecmp(arg, "invert") == 0 || strcasecmp(arg, "inv") == 0) {
+            if (osdDemoStartRaster(1)) {
+                cliPrintLine("osd_demo raster: INV 0->1 mid-cell (asymmetric HFILL glyph)");
+            } else {
+                cliPrintLine("osd_demo raster: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "sweep") == 0) {
+            if (osdDemoStartRaster(2)) {
+                cliPrintLine("osd_demo raster: SWEEP delay 0..20000 us step 1");
+            } else {
+                cliPrintLine("osd_demo raster: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "cal") == 0 || strcasecmp(arg, "calib") == 0) {
+            if (osdDemoStartRaster(3)) {
+                cliPrintLine("osd_demo raster CAL:");
+                cliPrintLine("  GOAL: centre probe = solid WHITE like the refs on left/right");
+                cliPrintLine("  (no blink, no growing bar — full white and steady)");
+                cliPrintLine("  then: osd_demo raster catch  (halves +/-range, keeps sweeping)");
+                cliPrintLine("  done: osd_demo raster commit | reset");
+            } else {
+                cliPrintLine("osd_demo raster: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "catch") == 0) {
+            osdDemoRasterCalEvent(0);
+            {
+                uint16_t c = 0, r = 0, d = 0;
+                osdDemoRasterCalGet(&c, &r, &d);
+                cliPrintLinef("osd_demo raster CATCH center=%u range=+/-%u (still sweeping)", c, r);
+            }
+            return;
+        }
+        if (strcasecmp(arg, "commit") == 0) {
+            osdDemoRasterCalEvent(1);
+            cliPrintLine("osd_demo raster: COMMIT -> GLYPH");
+            return;
+        }
+        if (strcasecmp(arg, "reset") == 0) {
+            osdDemoRasterCalEvent(2);
+            cliPrintLine("osd_demo raster: RESET cal to 16512 +/-1000");
+            return;
+        }
+        if (strcasecmp(arg, "delay") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            if (!val) {
+                cliPrintLine("usage: osd_demo raster delay <us>");
+                return;
+            }
+            osdDemoRasterSetDelayUs((uint16_t)atoi(val));
+            cliPrintLinef("osd_demo raster phase ≈ %u us (tick engine)", (unsigned)atoi(val));
+            return;
+        }
+        if (strcasecmp(arg, "phase") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            if (!val) {
+                cliPrintLine("usage: osd_demo raster phase <auto|+/-N|N>  (microseconds)");
+                return;
+            }
+            if (strcasecmp(val, "auto") == 0) {
+                const uint16_t ph = osdDemoRasterApplyAutoPhase();
+                cliPrintLinef("phase=auto %u us  (vblank+Y*18*line_us)", ph);
+                return;
+            }
+            // Human units = µs (same as `delay`). DWT ticks are ~10 ns — +/-1 tick is invisible.
+            {
+                const int32_t dus = atoi(val);
+                if (val[0] == '+' || (val[0] == '-' && val[1])) {
+                    const int32_t dt = (dus >= 0)
+                        ? (int32_t)clockMicrosToCycles((uint32_t)dus)
+                        : -(int32_t)clockMicrosToCycles((uint32_t)(-dus));
+                    osdDemoRasterAdjustPhaseTicks(dt);
+                } else {
+                    osdDemoRasterSetPhaseTicks(clockMicrosToCycles((uint32_t)dus));
+                }
+            }
+            {
+                uint32_t per = 0, ph = 0, hz = 0, late = 0, maxl = 0;
+                int32_t corr = 0;
+                osdDemoRasterGetTiming(&per, &ph, &hz, &late, &maxl, &corr);
+                cliPrintLinef("phase=%u us  (ticks=%u)",
+                              (hz ? (unsigned)((uint64_t)ph * 1000000ull / hz) : 0), ph);
+            }
+            return;
+        }
+        if (strcasecmp(arg, "period") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            if (!val) {
+                cliPrintLine("usage: osd_demo raster period <+/-N|N>  (fine corr us, clamp +/-1000; nominal fixed 2160000 ticks)");
+                return;
+            }
+            {
+                const int32_t dus = atoi(val);
+                if (val[0] == '+' || (val[0] == '-' && val[1])) {
+                    const int32_t dt = (dus >= 0)
+                        ? (int32_t)clockMicrosToCycles((uint32_t)dus)
+                        : -(int32_t)clockMicrosToCycles((uint32_t)(-dus));
+                    osdDemoRasterAdjustPeriodCorrectionTicks(dt);
+                } else {
+                    const int32_t corr = (dus >= 0)
+                        ? (int32_t)clockMicrosToCycles((uint32_t)dus)
+                        : -(int32_t)clockMicrosToCycles((uint32_t)(-dus));
+                    osdDemoRasterSetPeriodCorrectionTicks(corr);
+                }
+            }
+            {
+                uint32_t per = 0, ph = 0, hz = 0, late = 0, maxl = 0;
+                int32_t corr = 0;
+                osdDemoRasterGetTiming(&per, &ph, &hz, &late, &maxl, &corr);
+                const int32_t corrUs = hz ? (int32_t)clockCyclesToMicros(corr) : 0;
+                cliPrintLinef("nominal=2160000  corr=%c%u us (%c%u ticks)  effective=%u us",
+                              corrUs < 0 ? '-' : '+', (unsigned)(corrUs < 0 ? -corrUs : corrUs),
+                              corr < 0 ? '-' : '+', (unsigned)(corr < 0 ? -corr : corr),
+                              (hz ? (unsigned)((uint64_t)per * 1000000ull / hz) : 0));
+            }
+            return;
+        }
+        if (strcasecmp(arg, "period_ticks") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            if (!val) {
+                cliPrintLine("usage: osd_demo raster period_ticks <+/-N|N>  (fine corr in DWT ticks)");
+                return;
+            }
+            {
+                const int32_t dt = atoi(val);
+                if (val[0] == '+' || (val[0] == '-' && val[1])) {
+                    osdDemoRasterAdjustPeriodCorrectionTicks(dt);
+                } else {
+                    osdDemoRasterSetPeriodCorrectionTicks(dt);
+                }
+            }
+            {
+                uint32_t per = 0, ph = 0, hz = 0, late = 0, maxl = 0;
+                int32_t corr = 0;
+                osdDemoRasterGetTiming(&per, &ph, &hz, &late, &maxl, &corr);
+                cliPrintLinef("period_correction_ticks=%c%u  effective_period_ticks=%u",
+                              corr < 0 ? '-' : '+', (unsigned)(corr < 0 ? -corr : corr), per);
+            }
+            return;
+        }
+        if (strcasecmp(arg, "mark_interval") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            if (!val) {
+                cliPrintLine("usage: osd_demo raster mark_interval <N>");
+                return;
+            }
+            osdDemoRasterSetMarkInterval((uint16_t)atoi(val));
+            cliPrintLinef("mark_interval=%u", (unsigned)atoi(val));
+            return;
+        }
+        if (strcasecmp(arg, "mark_repeat") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            if (!val) {
+                cliPrintLine("usage: osd_demo raster mark_repeat <on|off>");
+                return;
+            }
+            const bool on = (strcasecmp(val, "on") == 0 || strcmp(val, "1") == 0);
+            osdDemoRasterSetMarkRepeat(on);
+            cliPrintLinef("mark_repeat=%s", on ? "on" : "off");
+            return;
+        }
+        if (strcasecmp(arg, "mark_start") == 0) {
+            if (osdDemoRasterMarkStart()) {
+                uint32_t per = 0, ph = 0, hz = 0, late = 0, maxl = 0;
+                int32_t corr = 0;
+                uint16_t iv = 0;
+                osdDemoRasterGetTiming(&per, &ph, &hz, &late, &maxl, &corr);
+                osdDemoRasterGetMarkStats(NULL, &iv, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                          NULL, NULL, NULL, NULL, NULL);
+                const uint32_t expectMs = hz
+                    ? (uint32_t)(((uint64_t)iv * (uint64_t)per * 1000ull) / hz) : 0;
+                cliPrintLinef("mark_start: WHITE flash every %u fields (~%u ms on software clock)",
+                              iv, expectMs);
+                cliPrintLine("  measure real gap between flashes on video timeline");
+            } else {
+                cliPrintLine("mark_start: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "calibrate") == 0) {
+            char *val = strtok_r(NULL, " ", &saveptr);
+            const uint16_t n = val ? (uint16_t)atoi(val) : 500;
+            if (osdDemoRasterCalibrate(n)) {
+                uint32_t per = 0, ph = 0, hz = 0, late = 0, maxl = 0;
+                int32_t corr = 0;
+                osdDemoRasterGetTiming(&per, &ph, &hz, &late, &maxl, &corr);
+                const uint16_t iv = n ? n : 500;
+                const uint32_t expectMs = hz
+                    ? (uint32_t)(((uint64_t)iv * (uint64_t)per * 1000ull) / hz) : 0;
+                cliPrintLinef("calibrate: WHITE square blinks every %u software fields", iv);
+                cliPrintLinef("  software expects ~%u ms between flashes", expectMs);
+                cliPrintLine("  1) record USB video");
+                cliPrintLine("  2) measure real ms between WHITE flashes on the timeline");
+                cliPrintLine("  3) real > expect => period too short: period_ticks +N");
+                cliPrintLine("  4) real < expect => period too long:  period_ticks -N");
+            } else {
+                cliPrintLine("calibrate: failed");
+            }
+            return;
+        }
+        if (strcasecmp(arg, "stats") == 0 || strcasecmp(arg, "timing") == 0
+            || strcasecmp(arg, "mark_stats") == 0) {
+            uint32_t per = 0, ph = 0, hz = 0, late = 0, maxl = 0;
+            int32_t corr = 0;
+            osdDemoRasterGetTiming(&per, &ph, &hz, &late, &maxl, &corr);
+            const uint32_t perUsX100 = hz ? (uint32_t)((uint64_t)per * 100000000ull / hz) : 0;
+            const uint32_t phUs = hz ? (uint32_t)((uint64_t)ph * 1000000ull / hz) : 0;
+            const uint32_t maxlUs = hz ? (uint32_t)((uint64_t)maxl * 1000000ull / hz) : 0;
+            const int32_t corrUs = hz ? (int32_t)clockCyclesToMicros(corr) : 0;
+            const uint32_t tickNs = hz ? (uint32_t)(1000000000ull / hz) : 0;
+            cliPrintLine("osd_demo raster timing (DWT CYCCNT deterministic wait):");
+            cliPrintLinef("  timer_hz=%u  tick=%u ns", hz, tickNs);
+            cliPrintLinef("  nominal_period_ticks=2160000");
+            cliPrintLinef("  period_correction_ticks=%c%u  (~%c%u us)",
+                          corr < 0 ? '-' : '+', (unsigned)(corr < 0 ? -corr : corr),
+                          corrUs < 0 ? '-' : '+', (unsigned)(corrUs < 0 ? -corrUs : corrUs));
+            cliPrintLinef("  effective_period_ticks=%u", per);
+            cliPrintLinef("  effective_period_us=%u.%02u", perUsX100 / 100u, perUsX100 % 100u);
+            cliPrintLinef("  phase_ticks=%u  phase_us=%u", ph, phUs);
+            cliPrintLinef("  late_events=%u  max_lateness_us=%u", late, maxlUs);
+            {
+                uint32_t locks = 0, tmo = 0, edge = 0;
+                osdDemoRasterGetVsyncStats(&locks, &tmo, &edge);
+                const uint8_t st = max7456ReadStat();
+                cliPrintLinef("  vsync_locks=%u  vsync_timeouts=%u  STAT=0x%02X (VSYNC=%u HSYNC=%u)",
+                              locks, tmo, st, (st >> 4) & 1, (st >> 3) & 1);
+                {
+                    const uint32_t lt = osdDemoRasterGetMeasuredLineTicks();
+                    const uint32_t lu = (lt && hz) ? (uint32_t)((uint64_t)lt * 1000000ull / hz) : 0;
+                    cliPrintLinef("  measured_line_ticks=%u  measured_line_us=%u", lt, lu);
+                }
+            }
+            {
+                uint32_t ev = 0, se = 0, ee = 0, st = 0, et = 0, exp = 0, ml = 0, mml = 0;
+                uint16_t iv = 0;
+                bool rep = false, act = false, done = false;
+                int32_t err = 0, epe = 0;
+                osdDemoRasterGetMarkStats(&ev, &iv, &rep, &act, &done, &se, &ee, &st, &et,
+                                          &exp, &err, &epe, &ml, &mml);
+                const uint32_t actual = et - st;
+                const uint32_t mmlUs = hz ? (uint32_t)((uint64_t)mml * 1000000ull / hz) : 0;
+                const int32_t epeNs = (int32_t)((int64_t)epe * 1000000000ll / (int64_t)(hz ? hz : 1));
+                cliPrintLine("  mark:");
+                cliPrintLinef("    raster_event_count=%u  mark_interval=%u  repeat=%s  active=%s",
+                              ev, iv, rep ? "on" : "off", act ? "yes" : "no");
+                cliPrintLinef("    mark_late_events=%u  mark_max_lateness=%u ticks (%u us)",
+                              ml, mml, mmlUs);
+                if (done) {
+                    cliPrintLinef("    start_event=%u end_event=%u", se, ee);
+                    cliPrintLinef("    start_tick=%u end_tick=%u", st, et);
+                    cliPrintLinef("    actual_elapsed_ticks=%u", actual);
+                    cliPrintLinef("    expected_elapsed_ticks=%u", exp);
+                    cliPrintLinef("    elapsed_error_ticks=%c%u",
+                                  err < 0 ? '-' : '+', (unsigned)(err < 0 ? -err : err));
+                    cliPrintLinef("    error_per_event_ticks=%c%u  error_per_event_ns=%c%u",
+                                  epe < 0 ? '-' : '+', (unsigned)(epe < 0 ? -epe : epe),
+                                  epeNs < 0 ? '-' : '+', (unsigned)(epeNs < 0 ? -epeNs : epeNs));
+                    cliPrintLine("    (DWT self-check). PAL: compare video ms between flashes to expect ms");
+                } else {
+                    cliPrintLine("    waiting for 2 flashes (calibrate / mark_start)");
+                }
+            }
+            return;
+        }
+        if (strcasecmp(arg, "cell") == 0 || strcasecmp(arg, "xy") == 0) {
+            char *sx = strtok_r(NULL, " ", &saveptr);
+            char *sy = strtok_r(NULL, " ", &saveptr);
+            if (!sx || !sy) {
+                cliPrintLine("usage: osd_demo raster cell <x> <y>");
+                return;
+            }
+            osdDemoRasterSetCell((uint8_t)atoi(sx), (uint8_t)atoi(sy));
+            cliPrintLinef("osd_demo raster cell = %d,%d", atoi(sx), atoi(sy));
+            return;
+        }
+        if (strcasecmp(arg, "glyphs") == 0) {
+            char *sa = strtok_r(NULL, " ", &saveptr);
+            char *sb = strtok_r(NULL, " ", &saveptr);
+            if (!sa || !sb) {
+                cliPrintLine("usage: osd_demo raster glyphs <a> <b>");
+                return;
+            }
+            osdDemoRasterSetGlyphs((uint8_t)atoi(sa), (uint8_t)atoi(sb));
+            cliPrintLinef("osd_demo raster glyphs A=%u B=%u", (unsigned)atoi(sa), (unsigned)atoi(sb));
+            return;
+        }
+        if (strcasecmp(arg, "status") == 0) {
+            uint8_t mode, x, y, ga, gb;
+            uint16_t delayUs;
+            osdDemoRasterGetStatus(&mode, &x, &y, &delayUs, &ga, &gb);
+            const char *modeName = (mode == 1) ? "INVERT" : ((mode == 2) ? "SWEEP" : ((mode == 3) ? "CAL" : ((mode == 4) ? "MARK" : ((mode == 5) ? "VSYNC" : ((mode == 6) ? "DIAG" : ((mode == 7) ? "FILL" : "GLYPH"))))));
+            cliPrintLinef("osd_demo raster %s cell=%u,%u phase_us=%u glyphA=%u glyphB=%u active=%d",
+                          modeName, x, y, delayUs, ga, gb, osdDemoIsActive() ? 1 : 0);
+            uint32_t per = 0, ph = 0, hz = 0, late = 0, maxl = 0;
+            int32_t corr = 0;
+            osdDemoRasterGetTiming(&per, &ph, &hz, &late, &maxl, &corr);
+            cliPrintLinef("  effective_period_ticks=%u corr_ticks=%c%u phase_ticks=%u late=%u",
+                          per, corr < 0 ? '-' : '+', (unsigned)(corr < 0 ? -corr : corr), ph, late);
+            return;
+        }
+
+        cliPrintLine("usage: osd_demo raster [glyph|vsync|diag|fill|invert|sweep|cal|catch|commit|reset|delay|phase|period|period_ticks|line_us|lead|mark_interval|mark_repeat|mark_start|calibrate|stats|cell|glyphs|status]");
+        return;
+    }
+
+    cliPrintLine("usage: osd_demo <play|stop|scene7|plasma2x2|hostest|raster …>");
+}
+
 #endif
 
 RAM_CODE static void cliProfile(const char *cmdName, char *cmdline)
@@ -8713,6 +9217,7 @@ const clicmd_t cmdTable[] = {
 #endif
 #ifdef USE_CHIPTUNE
     CLI_COMMAND_DEF("chiptune", "experimental piezo arpeggio player / dwell test", "[play|stop|test [dwellMs]|dwell <ms>]", cliChiptune),
+    CLI_COMMAND_DEF("osd_demo", "MAX7456 demoscene + mid-glyph plasma (scene7)", "play | stop | scene7 | plasma2x2 | hostest | raster …", cliOsdDemo),
 #endif
 #ifdef USE_LED_STRIP_STATUS_MODE
         CLI_COMMAND_DEF("color", "configure colors", NULL, cliColor),

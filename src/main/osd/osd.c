@@ -169,7 +169,7 @@ escSensorData_t *osdEscDataCombined;
 
 STATIC_ASSERT(OSD_POS_MAX == OSD_POS(63,31), OSD_POS_MAX_incorrect);
 
-PG_REGISTER_WITH_RESET_FN(osdConfig_t, osdConfig, PG_OSD_CONFIG, 13);
+PG_REGISTER_WITH_RESET_FN(osdConfig_t, osdConfig, PG_OSD_CONFIG, 14);
 
 PG_REGISTER_WITH_RESET_FN(osdElementConfig_t, osdElementConfig, PG_OSD_ELEMENT_CONFIG, 4);
 
@@ -454,6 +454,9 @@ void pgResetFn_osdConfig(osdConfig_t *osdConfig)
 #endif
     osdConfig->osd_custom_text_uart = SERIAL_PORT_NONE;
     osdConfig->osd_custom_text_baud = BAUD_115200;
+#ifdef USE_MAX7456
+    osdConfig->hud_motion = true;
+#endif
 }
 
 void pgResetFn_osdElementConfig(osdElementConfig_t *osdElementConfig)

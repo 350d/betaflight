@@ -134,6 +134,7 @@ COMMON_SRC = \
             fc/runtime_config.c \
             fc/stats.c \
             io/beeper.c \
+            io/osd_demo.c \
             io/chiptune.c \
             io/piniobox.c \
             io/serial.c \
