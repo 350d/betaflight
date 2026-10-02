@@ -123,6 +123,8 @@ uint16_t max7456EncodeDisplaySramRow(uint16_t rowAddr, const uint8_t *glyphs,
                                      const max7456SramSeg_t *seg, uint8_t nSeg, uint16_t *segLastByte);
 bool    max7456SendEncodedDisplaySram(uint16_t len);
 // Lock SPI for a mid-glyph field (20 MHz polled on AT, sticky DMM). Call End after the field.
+// Mid-glyph hot path: VOS = base + offset now (+ = down); returns the clamped offset applied.
+int8_t  max7456WriteVosOffsetNow(int8_t offsetPx);
 void    max7456MidGlyphSpiBegin(void);
 void    max7456MidGlyphSpiEnd(void);
 void    max7456MidGlyphSpiBoost(bool enable);

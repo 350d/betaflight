@@ -38,6 +38,10 @@
 #include "drivers/max7456.h"
 #include "drivers/system.h"
 #include "drivers/time.h"
+#include "drivers/timer.h"
+#include "drivers/nvic.h"
+#include "drivers/io.h"
+#include "drivers/sound_beeper.h"
 
 #include "osd/osd.h"
 
@@ -54,6 +58,11 @@
 
 #ifdef USE_CHIPTUNE
 #include "io/chiptune.h"
+#endif
+// Demo ↔ music hooks (autostart, beat clock, AY register tap) need the extended chiptune
+// API; with an older chiptune the demo runs silent with a fixed 120 BPM clock.
+#if defined(USE_CHIPTUNE) && defined(CHIPTUNE_DEMO_API)
+#define OSD_DEMO_CHIPTUNE
 #endif
 
 #ifdef USE_CLI
@@ -94,6 +103,8 @@
 #define OSD_DEMO_FX_TUNNEL_MS       20000
 #define OSD_DEMO_FX_PLASMA2X2_MS   18000
 #define OSD_DEMO_FX_TWISTER_MS     18000
+#define OSD_DEMO_FX_SHOUT_MS       40000
+#define OSD_DEMO_FX_PLASMA_IRQ_MS  18000
 #define OSD_DEMO_FIRE_IGNITE_MS     1500
 #define OSD_DEMO_FIRE_FALL_TICKS    4   // ticks per collapsed row (~1.1s for 16 rows @ 72Hz)
 #define OSD_DEMO_FIRE_STEP_TICKS    3   // flame physics ~24Hz @ SCROLL_HZ (was every tick)
@@ -114,6 +125,8 @@ typedef enum {
     OSD_DEMO_FX_TUNNEL,
     OSD_DEMO_FX_PLASMA2X2, // scene 7 — 2×2 mid-glyph plasma
     OSD_DEMO_FX_TWISTER,    // scene 8 — classic B/W ribbon twister (CLI scene8/twister)
+    OSD_DEMO_FX_SHOUT,      // scene 9 — FPV community shoutouts (3×3-px raster text)
+    OSD_DEMO_FX_PLASMA_IRQ, // scene 10 — scene 7's plasma on the TIM5 interrupt engine
 } osdDemoFx_e;
 
 typedef enum {
@@ -140,6 +153,9 @@ static timeMs_t fxStartMs;
 // Started by scene name from the CLI: stay on this scene (no auto-cycle). Mid-glyph scenes
 // (7, 8) just keep running; time-phased scenes restart themselves every period.
 static bool fxHold;
+#ifdef OSD_DEMO_CHIPTUNE
+static bool demoStartedChiptune; // stop the music on osd_demo stop only if the demo started it
+#endif
 static osdDemoFx_e fx;
 static uint16_t prevBouncePhase;
 static bool punchArmed;
@@ -197,7 +213,36 @@ static uint8_t tunnelMh;
 // Odd-line tear window: full 30-cell row @20 MHz ≈ 28–36 us. Budget must
 // cover overhead so the burst FINISHES before the lit even line (due).
 // Build the next band only if at least this long remains before the HSYNC of line due−1.
-#define OSD_DEMO_PLASMA2X2_PREFETCH_US 40
+#define OSD_DEMO_RASTER_PREFETCH_US 40
+// Scene 9 — FPV shoutouts on the raster engine: 3×3-px logical pixels.
+// Scene 10 — scene 7's plasma on the TIM5 interrupt engine.
+#define OSD_DEMO_IRQ_NOMINAL_FIELD_US 20000
+#define OSD_DEMO_IRQ_VSYNC_LEAD_US  300   // open the STAT window this early before the prediction
+#define OSD_DEMO_IRQ_VSYNC_WINDOW_US 1200 // past the predicted edge before giving up (dead-reckon)
+#define OSD_DEMO_IRQ_VSYNC_LEAD_MAX_US 4000
+#define OSD_DEMO_SHOUT_BAND_LINES   3
+#define OSD_DEMO_SHOUT_BANDS        (OSD_DEMO_CELL_H / OSD_DEMO_SHOUT_BAND_LINES) // 6
+#define OSD_DEMO_SHOUT_LP_PER_CELL  (OSD_DEMO_CELL_W / 3)                         // 4
+#define OSD_DEMO_SHOUT_LP_COLS      (OSD_DEMO_CHARS_PER_LINE * OSD_DEMO_SHOUT_LP_PER_CELL) // 120
+#define OSD_DEMO_SHOUT_LP_ROWS      (16 * OSD_DEMO_SHOUT_BANDS)                   // 96
+#define OSD_DEMO_SHOUT_FONT_ROWS    5    // 5×5 ink → bands 0..4, band 5 = 3-line gap
+#define OSD_DEMO_SHOUT_BASE         0x40 // scene bank (PX22 / XFILL reinstall on their entry)
+#define OSD_DEMO_SHOUT_GLYPHS       39   // 16 text masks + 11 left + 11 right bar cells + full
+#define OSD_DEMO_SHOUT_BAR_L        16   // bank offset: left bar "k px dither | black"
+#define OSD_DEMO_SHOUT_BAR_R        27   // bank offset: right bar "black | k px dither"
+#define OSD_DEMO_SHOUT_BAR_FULL     38   // bank offset: full dither cell
+#define OSD_DEMO_SHOUT_LIFE_BEATS   8    // quarter notes before a name starts to crumble
+#define OSD_DEMO_SHOUT_TRIES        48
+#define OSD_DEMO_SHOUT_MAX_EVICT    4    // oldest names dropped per beat to make room
+#define OSD_DEMO_SHOUT_ENV_LEVEL    13   // envelope-mode channels count as this volume
+#define OSD_DEMO_SHOUT_NOISE_ROWS   4    // noise-only channels flicker in the top bands
+#define OSD_DEMO_SHOUT_BAR_DECAY_Q8 256  // bar fall per frame (px << 8): full bar in ~0.5 s
+#define OSD_DEMO_SHOUT_MAX_WORDS    64
+#define OSD_DEMO_SHOUT_FALLBACK_BEAT_MS 500 // 120 BPM when no chiptune is playing
+#define OSD_DEMO_SHOUT_BOUNCE_LINES 6    // VOS hop height (lines, up)
+#define OSD_DEMO_SHOUT_BOUNCE_FIELDS 12  // hop duration
+#define OSD_DEMO_SHOUT_REBOUND_LINES 2   // small second hop
+#define OSD_DEMO_SHOUT_REBOUND_FIELDS 8
 // Classic plasma wave coeffs — wide contour bands on 180×144 2×2 grid.
 #define OSD_DEMO_PLASMA2X2_KX     3
 #define OSD_DEMO_PLASMA2X2_KY     2
@@ -303,7 +348,8 @@ static uint32_t mgStatWrites;
 static uint32_t mgStatSkips;
 static uint16_t mgStatMaxBytes;
 static uint16_t mgStatSkipRow[OSD_DEMO_MG_ROWS_MAX];
-static uint32_t mgStatIdleTicks;
+static uint64_t mgStatIdleTicks;
+static timeMs_t mgStatSinceMs;   // stats window start (fields per second in twstat)
 static uint32_t mgStatBytes;
 static uint32_t mgStatSlowBursts;  // bursts stretched by an IRQ (not learned from)
 static uint8_t mgSlowRun;
@@ -719,8 +765,27 @@ static void osdDemoPaintWipe(void);
 static void osdDemoPaintTunnel(void);
 static void osdDemoPlasma2x2EnginePoll(void);
 static void osdDemoTwisterEnginePoll(void);
+static void osdDemoShoutEnginePoll(void);
+static void osdDemoShoutEnter(void);
+static void osdDemoPlasmaIrqStop(void);
+static bool osdDemoPlasmaIrqStart(void);
+static void osdDemoPlasmaIrqTask(void);
+static bool osdDemoFxIsMidGlyph(osdDemoFx_e f);
 static void osdDemoPaintTwister(void);
 static void osdDemoWaitCycles(uint32_t deadlineTicks);
+// One planned race-the-beam burst and its start window (DWT ticks).
+typedef struct osdDemoMgBurst_s {
+    max7456SramSeg_t seg[OSD_DEMO_CHARS_PER_LINE];
+    const uint8_t *glyphs;
+    uint8_t row;
+    uint8_t nSeg;
+    uint16_t bytes;
+    uint32_t startAt;
+    uint32_t latest;
+} osdDemoMgBurst_t;
+static bool osdDemoMgChasePrepare(uint8_t row, const uint8_t *glyphs, uint8_t cols,
+                                  uint32_t hsyncPrev, uint32_t lineTicks, osdDemoMgBurst_t *bu);
+static bool osdDemoMgBurstSend(const osdDemoMgBurst_t *bu);
 static void osdDemoMgResetStats(void);
 static void osdDemoMgTrackLinePeriod(uint32_t edgeTicks, uint32_t nominalLineTicks);
 static inline int32_t osdDemoMgLineOffset(uint16_t line, uint32_t lineQ16);
@@ -1972,12 +2037,30 @@ static void osdDemoPlasma2x2BuildMasks(uint8_t y, uint8_t b,
     }
 }
 
-// Scene 7 engine. Same video model as scene 8 (measured line period, HSYNC re-lock per char
-// row, SRAM mirror + dirty runs) but writes race the beam: ~half of the 30 cells change per
-// band (~54 B), which can never finish inside the previous line, but always fits behind it.
-static void osdDemoPlasma2x2EnginePoll(void)
+// Universal mid-glyph raster engine (scenes 7 and 9). Same video model as scene 8 (measured
+// line period, per-field HSYNC phase, HSYNC re-lock per char row, SRAM mirror + planned
+// bursts) with writes racing the beam, so every changed cell has a whole line of window.
+// A scene supplies the band geometry (bandLines × bands = 18), a per-field hook (animation +
+// VOS motion for the next field) and a per-band glyph builder.
+typedef struct osdDemoRasterMotion_s {
+    int8_t vos; // whole-OSD vertical offset, lines (+ = down)
+} osdDemoRasterMotion_t;
+
+typedef struct osdDemoRaster_s {
+    uint8_t bandLines;   // video lines per band
+    uint8_t bands;       // bands per character row
+    bool *armed;
+    timeMs_t durationMs; // auto-cycle length (ignored when the scene is held)
+    // Per field, in VBLANK: animate; fill the motion applied from the NEXT field on.
+    void (*field)(uint8_t cols, uint8_t rows, bool frameStart, osdDemoRasterMotion_t *next);
+    void (*band)(uint8_t y, uint8_t b, uint8_t cols, uint8_t *glyphs);
+} osdDemoRaster_t;
+
+static uint8_t rasterFieldDiv; // frame grouping when twpair is off (free-running ÷2)
+
+static void osdDemoRasterEnginePoll(const osdDemoRaster_t *rs)
 {
-    if (!plasma2x2Armed || !demoDisplay) {
+    if (!*rs->armed || !demoDisplay) {
         return;
     }
 
@@ -1986,17 +2069,17 @@ static void osdDemoPlasma2x2EnginePoll(void)
     if (cols == 0 || rows == 0) {
         return;
     }
-    if (cols > OSD_DEMO_CHECKER_COLS) {
-        cols = OSD_DEMO_CHECKER_COLS;
+    if (cols > OSD_DEMO_CHARS_PER_LINE) {
+        cols = OSD_DEMO_CHARS_PER_LINE;
     }
-    if (rows > OSD_DEMO_CHECKER_ROWS) {
-        rows = OSD_DEMO_CHECKER_ROWS;
+    if (rows > OSD_DEMO_MG_ROWS_MAX) {
+        rows = OSD_DEMO_MG_ROWS_MAX;
     }
 
     const uint32_t nominalLineTicks = clockMicrosToCycles(OSD_DEMO_PAL_LINE_US);
     const uint32_t pivotTicks = clockMicrosToCycles(OSD_DEMO_PAL_VBLANK_US
         + OSD_DEMO_MG_PIVOT_LINE * OSD_DEMO_PAL_LINE_US);
-    const uint32_t prefetchLead = clockMicrosToCycles(OSD_DEMO_PLASMA2X2_PREFETCH_US);
+    const uint32_t prefetchLead = clockMicrosToCycles(OSD_DEMO_RASTER_PREFETCH_US);
     if (mgBurstFixedTicks == 0) {
         mgBurstFixedTicks = clockMicrosToCycles(OSD_DEMO_MG_BURST_FIXED_US);
     }
@@ -2004,15 +2087,15 @@ static void osdDemoPlasma2x2EnginePoll(void)
         mgByteTicksQ8 = (clockMicrosToCycles(30) << 8) / 36u;
     }
 
-    uint8_t glyphs[2][OSD_DEMO_CHECKER_COLS];
-    uint8_t packs[OSD_DEMO_CHECKER_COLS];
+    uint8_t glyphs[2][OSD_DEMO_CHARS_PER_LINE];
+    osdDemoRasterMotion_t motion = { 0 };
 
     max7456MidGlyphSpiBegin();
 
     uint8_t vsyncFails = 0;
-    while (active && plasma2x2Armed && !ARMING_FLAG(ARMED)) {
-        if (!fxHold && (millis() - fxStartMs) >= OSD_DEMO_FX_PLASMA2X2_MS) {
-            plasma2x2Armed = false;
+    while (active && *rs->armed && !ARMING_FLAG(ARMED)) {
+        if (!fxHold && (millis() - fxStartMs) >= rs->durationMs) {
+            *rs->armed = false;
             break;
         }
 
@@ -2021,7 +2104,7 @@ static void osdDemoPlasma2x2EnginePoll(void)
         if (!max7456WaitVsyncFallingEdge(&edgeTicks, OSD_DEMO_PAL_VSYNC_TIMEOUT_US)) {
             mgLastEdgeTicks = 0;
             if (++vsyncFails >= 8) {
-                plasma2x2Armed = false;
+                *rs->armed = false;
                 break;
             }
 #ifdef USE_CLI
@@ -2037,25 +2120,29 @@ static void osdDemoPlasma2x2EnginePoll(void)
         osdDemoMgTrackLinePeriod(edgeTicks, nominalLineTicks);
         const uint32_t lineQ16 = mgLineQ16;
         const uint32_t lineTicks = lineQ16 >> 16;
+        // VOS moves the whole OSD by whole lines: move the schedule with it (written in VBLANK,
+        // before the first OSD line of this field).
+        const int8_t vos = max7456WriteVosOffsetNow(motion.vos);
+
         const uint32_t pivot = edgeTicks + pivotTicks
-            + (uint32_t)(int32_t)((int32_t)mgShiftUs * (int32_t)clockMicrosToCycles(1));
+            + (uint32_t)(int32_t)((int32_t)mgShiftUs * (int32_t)clockMicrosToCycles(1))
+            + (uint32_t)((int32_t)vos * (int32_t)lineTicks);
         // First lit line from the same measured model as every band (not VSYNC + 1504 us:
         // with a 65.4 us line that is ~200 us = 3 lines too late, and the VBLANK preload
         // then ran into row 0 and made its band 1 miss the beam).
         const uint32_t row0 = pivot + (uint32_t)osdDemoMgLineOffset(0, lineQ16);
         osdDemoMgMeasureFieldPhase(edgeTicks, row0, lineTicks);
 
-        // One phase step per frame, on the field that starts it, so both woven fields carry
-        // the same plasma (twpair 1 flips the guess, twpair off = old free-running ÷2).
+        // Animation steps once per frame, on the field that starts it, so both woven fields
+        // carry the same picture (twpair 1 flips the guess, twpair off = free-running ÷2).
+        bool frameStart;
         if (twisterPairParity == OSD_DEMO_TWISTER_PAIR_OFF) {
-            if (++plasmaPhaseDiv >= 2u) {
-                plasmaPhaseDiv = 0;
-                plasmaPhase++;
-            }
-        } else if (mgFieldFirst == (twisterPairParity == 0u)) {
-            plasmaPhase++;
+            rasterFieldDiv ^= 1u;
+            frameStart = rasterFieldDiv != 0u;
+        } else {
+            frameStart = mgFieldFirst == (twisterPairParity == 0u);
         }
-        osdDemoPlasma2x2BuildLuts(cols, rows, plasmaPhase);
+        rs->field(cols, rows, frameStart, &motion);
 
         max7456MidGlyphSpiBoost(true);
 
@@ -2068,7 +2155,7 @@ static void osdDemoPlasma2x2EnginePoll(void)
             if ((int32_t)(getCycleCounter() - blankDeadline) > 0) {
                 break;
             }
-            osdDemoPlasma2x2BuildMasks(yPre, 0, cols, glyphs[0], packs);
+            rs->band(yPre, 0, cols, glyphs[0]);
             (void)osdDemoMgWriteRow(yPre, glyphs[0], 0, cols, 0, false, false);
         }
 
@@ -2077,24 +2164,24 @@ static void osdDemoPlasma2x2EnginePoll(void)
 
         for (uint8_t y = 0; y < rows; y++) {
             const uint8_t b0 = (y < yPre) ? 1u : 0u;
-            // 3 write-free lines before a preloaded row: re-lock to the real HSYNC.
+            // Write-free lines before a preloaded row: re-lock to the real HSYNC.
             if (y < yPre && mgHsyncLock) {
                 osdDemoMgHsyncMeasure(y, pivot, lineQ16, &hsyncRef, &hsyncHaveRef);
             }
 
             uint8_t cur = 0;
-            osdDemoPlasma2x2BuildMasks(y, b0, cols, glyphs[cur], packs);
+            rs->band(y, b0, cols, glyphs[cur]);
 
-            for (uint8_t b = b0; b < OSD_DEMO_PLASMA2X2_BANDS; b++) {
-                const uint16_t dueLine = (uint16_t)((uint16_t)y * OSD_DEMO_CHECKER_CELL_H
-                                                    + (uint16_t)b * OSD_DEMO_PLASMA2X2_STEP);
+            for (uint8_t b = b0; b < rs->bands; b++) {
+                const uint16_t dueLine = (uint16_t)((uint16_t)y * OSD_DEMO_CELL_H
+                                                    + (uint16_t)b * rs->bandLines);
                 const uint32_t hsyncPrev = osdDemoMgHsyncAt((uint16_t)(dueLine - 1u), pivot, lineQ16);
-                const bool hasNext = (uint8_t)(b + 1u) < OSD_DEMO_PLASMA2X2_BANDS;
+                const bool hasNext = (uint8_t)(b + 1u) < rs->bands;
 
                 // Build the next band while the beam is still ahead of us.
                 bool nextBuilt = false;
                 if (hasNext && (int32_t)(hsyncPrev - prefetchLead - getCycleCounter()) > 0) {
-                    osdDemoPlasma2x2BuildMasks(y, (uint8_t)(b + 1u), cols, glyphs[cur ^ 1u], packs);
+                    rs->band(y, (uint8_t)(b + 1u), cols, glyphs[cur ^ 1u]);
                     nextBuilt = true;
                 }
 
@@ -2107,7 +2194,7 @@ static void osdDemoPlasma2x2EnginePoll(void)
 
                 if (hasNext) {
                     if (!nextBuilt) {
-                        osdDemoPlasma2x2BuildMasks(y, (uint8_t)(b + 1u), cols, glyphs[cur ^ 1u], packs);
+                        rs->band(y, (uint8_t)(b + 1u), cols, glyphs[cur ^ 1u]);
                     }
                     cur ^= 1u;
                 }
@@ -2122,8 +2209,898 @@ static void osdDemoPlasma2x2EnginePoll(void)
         max7456MidGlyphSpiBoost(false);
     }
 
+    (void)max7456WriteVosOffsetNow(0);
     max7456MidGlyphSpiEnd();
 }
+
+// --- Scene 7: 2×2 plasma on the raster engine ---------------------------------------------
+
+static void osdDemoPlasma2x2Field(uint8_t cols, uint8_t rows, bool frameStart,
+                                  osdDemoRasterMotion_t *next)
+{
+    if (frameStart) {
+        plasmaPhase++;
+    }
+    osdDemoPlasma2x2BuildLuts(cols, rows, plasmaPhase);
+    next->vos = 0;
+}
+
+static void osdDemoPlasma2x2Band(uint8_t y, uint8_t b, uint8_t cols, uint8_t *glyphs)
+{
+    uint8_t packs[OSD_DEMO_CHECKER_COLS];
+    osdDemoPlasma2x2BuildMasks(y, b, cols, glyphs, packs);
+}
+
+static void osdDemoPlasma2x2EnginePoll(void)
+{
+    static const osdDemoRaster_t plasmaRaster = {
+        .bandLines = OSD_DEMO_PLASMA2X2_STEP,
+        .bands = OSD_DEMO_PLASMA2X2_BANDS,
+        .armed = &plasma2x2Armed,
+        .durationMs = OSD_DEMO_FX_PLASMA2X2_MS,
+        .field = osdDemoPlasma2x2Field,
+        .band = osdDemoPlasma2x2Band,
+    };
+    osdDemoRasterEnginePoll(&plasmaRaster);
+}
+
+// --- Scene 9: FPV shoutouts ----------------------------------------------------------------
+// 3×3-px logical pixels: 4 per cell × 6 bands of 3 lines → 120×96 over the screen. The 5×5
+// font fills 5 bands of a character row and leaves exactly one 3-line band between rows.
+// A new name appears on every quarter note, blinks white/black every frame until the next one,
+// then stays white; every beat bounces the whole OSD up via VOS (hop + small rebound).
+
+static const char *const osdDemoShoutNames[] = {
+    "CHARPU", "MR STEELE", "SKITZO", "LE DRIB", "UMMAGAWD", "FINALGLIDEAUS", "STINGERSWARM",
+    "MATTYSTUNTZ", "JOHNNYFPV", "NURKFPV", "CRICKETFPV", "BOTGRINDER", "ZOEFPV", "VORT3X",
+    "BARDWELL", "VANOVER", "HEADSUP", "MCKFPV", "NYTFURY", "JET", "BMSTHOMAS", "PHATKID",
+    "WILDWILLY", "NUBB", "GAB707", "JBOX", "PAWELOSFPV", "YUKI FPV", "DARKEX",
+    "QUADMOVR", "J-TRUE", "VIKFPV", "NOICAL", "SKYWAKKA", "WESTPYSDE", "HIFLITE",
+    "NATHANLOOPZ", "ERODYO", "RECKLESS_FPV", "SLATTFPV", "JACUZZI JAY", "MARIUSFPV",
+    "FENIXFPV", "AUXPLUMES", "TINE_XD", "LUMPYFPV", "PDEVX", "BUBBYFPV", "YOUDONTKNOWME",
+    "PATRICK WATKINS", "MAGIC CARPET", "FPVEGAN", "CIOTTIFPV", "INFINITYLOOPS", "NICK BURNS",
+    "OSCAR LIANG", "CHRIS ROSSER", "UAV TECH", "MAD'S TECH",
+    "BORISBSTYLE", "HYDRA", "TIMECOP", "BLCKMN", "MIKELLER", "CTZSNOOZE", "LEDVINAP",
+    "JFLYPER", "MARTINBUDDEN", "SKAMAN82", "STEVECEVANS", "HASLINGHUIS", "CAPNBRY",
+    "DIGITALENTITY", "ALEXINPARIS", "KILRAH",
+    "ALYXFPV", "BORODA", "MARTINOSFPV", "BOGDAN", "ANIKFPV", "RECOPTER",
+};
+#define OSD_DEMO_SHOUT_COUNT      ARRAYLEN(osdDemoShoutNames)
+
+// Names go to random free spots of the text area (columns 1..28, ≥ 1 character of air) on
+// every quarter note; after LIFE_BEATS beats a name crumbles — every frame one random letter
+// steps letter → '-' → '.' → gone — and is removed once empty. Columns 0 and 29 carry a 16-band AY
+// "spectrum": per character row, a horizontal bar with 1-px resolution growing from the
+// screen edge (XFILL-style partial cells, as in scene 8).
+typedef struct {
+    uint8_t row;
+    uint8_t x;      // logical px, absolute (text area starts at column 1)
+    uint8_t w;      // logical px
+    uint8_t name;   // index into osdDemoShoutNames
+    uint16_t born;  // beat number it appeared on
+    uint32_t decay; // 2 bits per letter: 0 letter, 1 '-', 2 '.', 3 gone (crumbling once expired)
+} osdDemoShoutWord_t;
+
+static bool shoutArmed;
+static uint8_t shoutFb[OSD_DEMO_SHOUT_LP_ROWS][OSD_DEMO_SHOUT_LP_COLS / 8u];
+static osdDemoShoutWord_t shoutWords[OSD_DEMO_SHOUT_MAX_WORDS];
+static uint8_t shoutWordCount;
+static uint16_t shoutBeatNo;
+static uint8_t shoutOrder[OSD_DEMO_SHOUT_COUNT];
+static uint8_t shoutNext;
+static int8_t shoutNewest = -1;  // word index that blinks
+static bool shoutBlinkBlack;
+#ifdef OSD_DEMO_CHIPTUNE
+static uint8_t shoutLastPulse; // tracker line counter seen last (beat clock)
+static uint8_t shoutLineAcc;
+#endif
+static timeMs_t shoutLastBeatMs;
+static uint8_t shoutBounceT; // fields since the last beat (hop + rebound)
+static bool shoutBeatPending;
+static uint8_t shoutRowWhite[OSD_DEMO_MG_ROWS_MAX]; // RB white level last written per row
+static uint16_t shoutBarQ8[2][OSD_DEMO_MG_ROWS_MAX]; // spectrum bars, px << 8 (left, right)
+
+// Glyph bank @ SHOUT_BASE: 0..15 white 4-column masks on black (mask 0 = blink-off/black);
+// 16..26 left bar "k px dither | black" (k = 1..11); 27..37 right bar "black | k px dither";
+// 38 full dither. Checker phase from the glyph row, so 3-line bands tile seamlessly.
+static void osdDemoShoutBuildGlyph(uint8_t *nvm, uint8_t idx)
+{
+    for (uint8_t r = 0; r < OSD_DEMO_CELL_H; r++) {
+        for (uint8_t c = 0; c < OSD_DEMO_CELL_W; c += 4u) {
+            uint8_t v = 0;
+            for (uint8_t k = 0; k < 4u; k++) {
+                const uint8_t px = (uint8_t)(c + k);
+                bool on;
+                if (idx < OSD_DEMO_SHOUT_BAR_L) {
+                    const uint8_t lp = (uint8_t)(px / 3u); // 0..3, leftmost = mask bit 3
+                    on = ((idx >> (3u - lp)) & 1u) != 0u;
+                } else {
+                    bool inBar;
+                    if (idx < OSD_DEMO_SHOUT_BAR_R) {
+                        inBar = px < (uint8_t)(idx - OSD_DEMO_SHOUT_BAR_L + 1u);
+                    } else if (idx < OSD_DEMO_SHOUT_BAR_FULL) {
+                        inBar = px >= (uint8_t)(OSD_DEMO_CELL_W - (idx - OSD_DEMO_SHOUT_BAR_R + 1u));
+                    } else {
+                        inBar = true;
+                    }
+                    on = inBar && ((px ^ r) & 1u) == 0u;
+                }
+                v = (uint8_t)((v << 2) | (on ? OSD_DEMO_PX_W : OSD_DEMO_PX_B));
+            }
+            nvm[(uint16_t)r * 3u + c / 4u] = v;
+        }
+    }
+}
+
+static void osdDemoShoutInstallGlyphs(void)
+{
+    uint8_t nvm[OSD_DEMO_GLYPH_BYTES];
+    for (uint8_t i = 0; i < OSD_DEMO_SHOUT_GLYPHS; i++) {
+        osdDemoShoutBuildGlyph(nvm, i);
+        (void)max7456WriteNvm((uint8_t)(OSD_DEMO_SHOUT_BASE + i), nvm);
+    }
+    max7456EndFontWrite();
+}
+
+static uint8_t osdDemoShoutWidth(uint8_t name)
+{
+    return (uint8_t)(strlen(osdDemoShoutNames[name]) * OSD_DEMO_FONT_ADVANCE - 1u);
+}
+
+static void osdDemoShoutShuffle(void)
+{
+    for (uint8_t i = 0; i < OSD_DEMO_SHOUT_COUNT; i++) {
+        shoutOrder[i] = i;
+    }
+    for (uint8_t i = (uint8_t)(OSD_DEMO_SHOUT_COUNT - 1u); i > 0u; i--) {
+        const uint8_t j = (uint8_t)(osdDemoRand() % (uint32_t)(i + 1u));
+        const uint8_t t = shoutOrder[i];
+        shoutOrder[i] = shoutOrder[j];
+        shoutOrder[j] = t;
+    }
+    shoutNext = 0;
+}
+
+static void osdDemoShoutPaint(const osdDemoShoutWord_t *wd, bool on)
+{
+    const uint16_t lpRow0 = (uint16_t)wd->row * OSD_DEMO_SHOUT_BANDS;
+    if (!on) {
+        for (uint8_t r = 0; r < OSD_DEMO_SHOUT_FONT_ROWS; r++) {
+            for (uint16_t x = wd->x; x < (uint16_t)wd->x + wd->w; x++) {
+                shoutFb[lpRow0 + r][x >> 3] &= (uint8_t)~(0x80u >> (x & 7u));
+            }
+        }
+        return;
+    }
+    static const char stageChar[4] = { 0, '-', '.', ' ' };
+    const char *s = osdDemoShoutNames[wd->name];
+    for (uint8_t ci = 0; s[ci]; ci++) {
+        const uint8_t stage = (uint8_t)((wd->decay >> (2u * ci)) & 3u);
+        const uint8_t code = stage ? (uint8_t)stageChar[stage] : (uint8_t)s[ci];
+        if (code >= OSD_DEMO_FONT_GLYPHS) {
+            continue;
+        }
+        for (uint8_t r = 0; r < OSD_DEMO_SHOUT_FONT_ROWS; r++) {
+            const uint8_t bits = osdDemoFontBits[code][OSD_DEMO_TUNNEL_INK_Y0 + r];
+            for (uint8_t px = 0; px < OSD_DEMO_FONT_W; px++) {
+                if (bits & (0x80u >> px)) {
+                    const uint16_t x = (uint16_t)(wd->x + ci * OSD_DEMO_FONT_ADVANCE + px);
+                    shoutFb[lpRow0 + r][x >> 3] |= (uint8_t)(0x80u >> (x & 7u));
+                }
+            }
+        }
+    }
+}
+
+static bool osdDemoShoutOnScreen(uint8_t name)
+{
+    for (uint8_t i = 0; i < shoutWordCount; i++) {
+        if (shoutWords[i].name == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool osdDemoShoutFits(uint8_t row, uint8_t x, uint8_t w)
+{
+    for (uint8_t i = 0; i < shoutWordCount; i++) {
+        const osdDemoShoutWord_t *o = &shoutWords[i];
+        if (o->row != row) {
+            continue;
+        }
+        // At least one character (6 logical px) of air between names.
+        const bool leftOk = (uint16_t)x + w + OSD_DEMO_FONT_ADVANCE <= o->x;
+        const bool rightOk = (uint16_t)o->x + o->w + OSD_DEMO_FONT_ADVANCE <= x;
+        if (!leftOk && !rightOk) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void osdDemoShoutRemove(uint8_t i)
+{
+    osdDemoShoutPaint(&shoutWords[i], false);
+    if (shoutNewest == (int8_t)i) {
+        shoutNewest = -1;
+    } else if (shoutNewest == (int8_t)(shoutWordCount - 1u)) {
+        shoutNewest = (int8_t)i; // the last entry moves into the hole
+    }
+    shoutWords[i] = shoutWords[--shoutWordCount];
+}
+
+// One quarter note: expire old names, then place the next one at a random free spot.
+static void osdDemoShoutBeat(uint8_t cols, uint8_t rows)
+{
+    shoutBeatNo++;
+    if (shoutWordCount >= OSD_DEMO_SHOUT_MAX_WORDS) {
+        osdDemoShoutRemove(0); // table full (cannot happen on a 30×16 screen, but be exact)
+    }
+    // Next name not already on screen.
+    uint8_t name = shoutOrder[shoutNext];
+    for (uint8_t n = 0; n < OSD_DEMO_SHOUT_COUNT && osdDemoShoutOnScreen(name); n++) {
+        if (++shoutNext >= OSD_DEMO_SHOUT_COUNT) {
+            osdDemoShoutShuffle();
+        }
+        name = shoutOrder[shoutNext];
+    }
+    const uint8_t w = osdDemoShoutWidth(name);
+    const uint8_t x0 = OSD_DEMO_SHOUT_LP_PER_CELL;                                     // column 1
+    const uint8_t x1 = (uint8_t)((cols - 1u) * OSD_DEMO_SHOUT_LP_PER_CELL);          // column cols-1
+    if (w > (uint8_t)(x1 - x0)) {
+        return;
+    }
+    osdDemoShoutWord_t wd = { 0, 0, w, name, shoutBeatNo, 0 };
+    // No room → drop the oldest name and try again, so a new name appears on every beat.
+    for (uint8_t evict = 0; evict <= OSD_DEMO_SHOUT_MAX_EVICT; evict++) {
+        for (uint8_t tries = 0; tries < OSD_DEMO_SHOUT_TRIES; tries++) {
+            wd.row = (uint8_t)(osdDemoRand() % rows);
+            wd.x = (uint8_t)(x0 + osdDemoRand() % (uint32_t)(x1 - x0 - w + 1u));
+            if (osdDemoShoutFits(wd.row, wd.x, w)) {
+                if (++shoutNext >= OSD_DEMO_SHOUT_COUNT) {
+                    osdDemoShoutShuffle();
+                }
+                shoutWords[shoutWordCount] = wd;
+                shoutNewest = (int8_t)shoutWordCount;
+                shoutWordCount++;
+                osdDemoShoutPaint(&wd, true);
+                shoutBlinkBlack = false;
+                shoutBounceT = 0;
+                return;
+            }
+        }
+        if (shoutWordCount == 0u) {
+            return;
+        }
+        uint8_t oldest = 0;
+        for (uint8_t i = 1; i < shoutWordCount; i++) {
+            if ((uint16_t)(shoutBeatNo - shoutWords[i].born) > (uint16_t)(shoutBeatNo - shoutWords[oldest].born)) {
+                oldest = i;
+            }
+        }
+        osdDemoShoutRemove(oldest);
+    }
+}
+
+// Beats from the tracker: PT3 lines at 50/speed Hz, a quarter ≈ 0.5 s → 2/4/8/16 lines.
+// Without music: a fixed 120 BPM clock.
+static uint8_t osdDemoShoutBeats(void)
+{
+#ifdef OSD_DEMO_CHIPTUNE
+    const uint8_t speed = chiptuneGetSpeed();
+    if (speed > 0u) {
+        uint8_t lpb = 2;
+        while (lpb < 16u && (uint16_t)lpb * speed * 2u < 50u) {
+            lpb = (uint8_t)(lpb * 2u);
+        }
+        const uint8_t pulse = chiptuneGetLinePulse();
+        shoutLineAcc = (uint8_t)(shoutLineAcc + (uint8_t)(pulse - shoutLastPulse));
+        shoutLastPulse = pulse;
+        uint8_t beats = 0;
+        while (shoutLineAcc >= lpb) {
+            shoutLineAcc = (uint8_t)(shoutLineAcc - lpb);
+            beats++;
+        }
+        return beats;
+    }
+#endif
+    const timeMs_t now = millis();
+    if ((timeDelta_t)(now - shoutLastBeatMs) >= OSD_DEMO_SHOUT_FALLBACK_BEAT_MS) {
+        shoutLastBeatMs = now;
+        return 1;
+    }
+    return 0;
+}
+
+// AY "spectrum" from the live register frame (no FFT): each tone channel lands in a
+// half-octave band by its period (row 0 = highest pitch), its volume sets the bar; noise
+// lights the top bands. Stereo like the Spectrum's ABC: left = A + ½B, right = C + ½B.
+static void osdDemoShoutUpdateBars(uint8_t rows)
+{
+    uint8_t target[2][OSD_DEMO_MG_ROWS_MAX];
+    memset(target, 0, sizeof(target));
+#ifdef OSD_DEMO_CHIPTUNE
+    uint8_t regs[16];
+    if (chiptuneGetAyRegs(regs)) {
+        const uint8_t mixer = regs[7];
+        for (uint8_t ch = 0; ch < 3u; ch++) {
+            const uint8_t volReg = regs[8u + ch];
+            const uint8_t vol = (volReg & 0x10u) ? (uint8_t)OSD_DEMO_SHOUT_ENV_LEVEL : (uint8_t)(volReg & 0x0Fu);
+            if (vol == 0u) {
+                continue;
+            }
+            const uint8_t len = (uint8_t)((vol * OSD_DEMO_CELL_W + 7u) / 15u); // 0..12 px
+            const bool tone = (mixer & (1u << ch)) == 0u;
+            const bool noise = (mixer & (8u << ch)) == 0u;
+            uint8_t row = 0xFF;
+            if (tone) {
+                const uint16_t period = (uint16_t)(regs[ch * 2u] | ((regs[ch * 2u + 1u] & 0x0Fu) << 8));
+                if (period > 0u) {
+                    uint8_t msb = 0;
+                    while ((uint16_t)(period >> (msb + 1u)) != 0u) {
+                        msb++;
+                    }
+                    const uint8_t half = (msb > 0u) ? (uint8_t)((period >> (msb - 1u)) & 1u) : 0u;
+                    // period 16 (≈ 6.9 kHz) → row 0 … period 4095 (≈ 27 Hz) → row 15.
+                    const int16_t r = (int16_t)((int16_t)msb - 4) * 2 + half;
+                    row = (uint8_t)constrain(r, 0, (int16_t)rows - 1);
+                }
+            } else if (noise) {
+                row = (uint8_t)(osdDemoRand() % OSD_DEMO_SHOUT_NOISE_ROWS);
+            }
+            if (row == 0xFF) {
+                continue;
+            }
+            const uint8_t side[3][2] = { { 2, 0 }, { 1, 1 }, { 0, 2 } }; // A, B, C weights /2
+            for (uint8_t sd = 0; sd < 2u; sd++) {
+                const uint8_t l = (uint8_t)((len * side[ch][sd]) / 2u);
+                for (int8_t dr = -1; dr <= 1; dr++) { // soft neighbours
+                    const int8_t rr = (int8_t)(row + dr);
+                    if (rr < 0 || rr >= (int8_t)rows) {
+                        continue;
+                    }
+                    const uint8_t v = dr ? (uint8_t)(l / 2u) : l;
+                    if (v > target[sd][rr]) {
+                        target[sd][rr] = v;
+                    }
+                }
+            }
+        }
+    }
+#endif
+    for (uint8_t sd = 0; sd < 2u; sd++) {
+        for (uint8_t y = 0; y < rows && y < OSD_DEMO_MG_ROWS_MAX; y++) {
+            const uint16_t t = (uint16_t)target[sd][y] << 8;
+            uint16_t *b = &shoutBarQ8[sd][y];
+            // Attack at once, fall back slowly (classic analyser feel).
+            if (t >= *b) {
+                *b = t;
+            } else {
+                *b = (*b - t > OSD_DEMO_SHOUT_BAR_DECAY_Q8) ? (uint16_t)(*b - OSD_DEMO_SHOUT_BAR_DECAY_Q8) : t;
+            }
+        }
+    }
+}
+
+// Once per frame: every expired name moves one random letter a step towards gone.
+static void osdDemoShoutCrumble(void)
+{
+    for (uint8_t i = 0; i < shoutWordCount;) {
+        osdDemoShoutWord_t *wd = &shoutWords[i];
+        if ((uint16_t)(shoutBeatNo - wd->born) < OSD_DEMO_SHOUT_LIFE_BEATS) {
+            i++;
+            continue;
+        }
+        const uint8_t len = (uint8_t)strlen(osdDemoShoutNames[wd->name]);
+        uint8_t alive = 0;
+        for (uint8_t c = 0; c < len; c++) {
+            alive = (uint8_t)(alive + (((wd->decay >> (2u * c)) & 3u) != 3u));
+        }
+        if (alive == 0u) {
+            osdDemoShoutRemove(i); // fully crumbled (clears its pixels); re-check slot i
+            continue;
+        }
+        uint8_t pick = (uint8_t)(osdDemoRand() % alive);
+        for (uint8_t c = 0; c < len; c++) {
+            if (((wd->decay >> (2u * c)) & 3u) != 3u && pick-- == 0u) {
+                wd->decay += 1u << (2u * c);
+                break;
+            }
+        }
+        osdDemoShoutPaint(wd, false);
+        osdDemoShoutPaint(wd, true);
+        i++;
+    }
+}
+
+// Bounce after each beat: a main hop and a small rebound (two parabolas), in lines up.
+static int8_t osdDemoShoutBounce(void)
+{
+    static const uint8_t hopFields[2] = { OSD_DEMO_SHOUT_BOUNCE_FIELDS, OSD_DEMO_SHOUT_REBOUND_FIELDS };
+    static const uint8_t hopLines[2] = { OSD_DEMO_SHOUT_BOUNCE_LINES, OSD_DEMO_SHOUT_REBOUND_LINES };
+    uint8_t t = shoutBounceT;
+    for (uint8_t h = 0; h < 2u; h++) {
+        if (t < hopFields[h]) {
+            const int32_t n = hopFields[h];
+            shoutBounceT++;
+            return (int8_t)-((4 * (int32_t)hopLines[h] * t * (n - t) + n * n / 2) / (n * n));
+        }
+        t = (uint8_t)(t - hopFields[h]);
+    }
+    return 0;
+}
+
+// Row brightness gradient from the active (newest) row: RB white 120 / 100 / 90 / 80 %.
+static void osdDemoShoutApplyRowBrightness(uint8_t rows)
+{
+    const int8_t active = (shoutNewest >= 0) ? (int8_t)shoutWords[shoutNewest].row : -1;
+    for (uint8_t y = 0; y < rows && y < OSD_DEMO_MG_ROWS_MAX; y++) {
+        uint8_t white = 3;
+        if (active >= 0) {
+            const uint8_t d = (uint8_t)((y > active) ? (y - active) : (active - y));
+            white = (d >= 3u) ? 0u : (uint8_t)(3u - d);
+        }
+        if (white != shoutRowWhite[y]) {
+            shoutRowWhite[y] = white;
+            max7456BrightnessRow(y, 0, white);
+        }
+    }
+}
+
+static void osdDemoShoutField(uint8_t cols, uint8_t rows, bool frameStart,
+                              osdDemoRasterMotion_t *next)
+{
+    // Picture changes only on the field that starts a frame (both woven fields identical):
+    // a beat that lands on the second field waits for the next frame start.
+    if (osdDemoShoutBeats() > 0u) {
+        shoutBeatPending = true;
+    }
+    if (frameStart) {
+        if (shoutBeatPending) {
+            shoutBeatPending = false;
+            osdDemoShoutBeat(cols, rows);
+        } else if (shoutNewest >= 0) {
+            shoutBlinkBlack = !shoutBlinkBlack; // newest name: white/black every frame
+        }
+        osdDemoShoutCrumble();
+        osdDemoShoutUpdateBars(rows);
+    }
+    osdDemoShoutApplyRowBrightness(rows); // RB registers, in VBLANK, only rows that change
+    next->vos = osdDemoShoutBounce();
+}
+
+static uint8_t osdDemoShoutBarGlyph(uint16_t q8, bool right)
+{
+    const uint8_t px = (uint8_t)MIN(q8 >> 8, OSD_DEMO_CELL_W);
+    if (px == 0u) {
+        return OSD_DEMO_SHOUT_BASE;          // mask 0: black
+    }
+    if (px >= OSD_DEMO_CELL_W) {
+        return (uint8_t)(OSD_DEMO_SHOUT_BASE + OSD_DEMO_SHOUT_BAR_FULL);
+    }
+    return (uint8_t)(OSD_DEMO_SHOUT_BASE + (right ? OSD_DEMO_SHOUT_BAR_R : OSD_DEMO_SHOUT_BAR_L) + px - 1u);
+}
+
+static void osdDemoShoutBand(uint8_t y, uint8_t b, uint8_t cols, uint8_t *glyphs)
+{
+    if (b >= OSD_DEMO_SHOUT_FONT_ROWS) {
+        memset(glyphs, OSD_DEMO_SHOUT_BASE, cols); // the 3-line gap band (text and bars)
+        return;
+    }
+    const uint8_t *line = shoutFb[(uint16_t)y * OSD_DEMO_SHOUT_BANDS + b];
+    uint8_t blackL = 0xFF;
+    uint8_t blackR = 0;
+    if (shoutNewest >= 0 && shoutBlinkBlack && shoutWords[shoutNewest].row == y) {
+        const osdDemoShoutWord_t *wd = &shoutWords[shoutNewest];
+        blackL = (uint8_t)(wd->x / OSD_DEMO_SHOUT_LP_PER_CELL);
+        blackR = (uint8_t)((wd->x + wd->w - 1u) / OSD_DEMO_SHOUT_LP_PER_CELL);
+    }
+    for (uint8_t x = 1; x + 1u < cols; x++) {
+        const uint8_t byte = line[x >> 1];
+        const uint8_t nib = (x & 1u) ? (uint8_t)(byte & 0x0Fu) : (uint8_t)(byte >> 4);
+        const bool black = x >= blackL && x <= blackR; // whole cell belongs to this name
+        glyphs[x] = (uint8_t)(OSD_DEMO_SHOUT_BASE + (black ? 0u : nib));
+    }
+    const uint8_t row = (y < OSD_DEMO_MG_ROWS_MAX) ? y : (uint8_t)(OSD_DEMO_MG_ROWS_MAX - 1u);
+    glyphs[0] = osdDemoShoutBarGlyph(shoutBarQ8[0][row], false);
+    glyphs[cols - 1u] = osdDemoShoutBarGlyph(shoutBarQ8[1][row], true);
+}
+
+static void osdDemoShoutEnginePoll(void)
+{
+    static const osdDemoRaster_t shoutRaster = {
+        .bandLines = OSD_DEMO_SHOUT_BAND_LINES,
+        .bands = OSD_DEMO_SHOUT_BANDS,
+        .armed = &shoutArmed,
+        .durationMs = OSD_DEMO_FX_SHOUT_MS,
+        .field = osdDemoShoutField,
+        .band = osdDemoShoutBand,
+    };
+    osdDemoRasterEnginePoll(&shoutRaster);
+}
+
+static void osdDemoShoutEnter(void)
+{
+    max7456Osdm(0x1B);
+    max7456Brightness(0, 3);
+    max7456SetBackgroundType(DISPLAY_BACKGROUND_BLACK);
+    max7456SetHudMotionOffset(0, 0);
+    osdDemoShoutInstallGlyphs(); // 39 × NVM write, once per scene entry
+    if (demoDisplay) {
+        osdDemoFillRowsGlyphFast(demoDisplay->cols, demoDisplay->rows,
+                                 OSD_DEMO_SHOUT_BASE, OSD_DEMO_SHOUT_BASE);
+    } else {
+        max7456FillScreen(OSD_DEMO_SHOUT_BASE);
+    }
+    memset(mgSram, 0xFF, sizeof(mgSram)); // 0xFF never in a row → first field rewrites all
+    mgLastEdgeTicks = 0;
+    osdDemoMgResetStats();
+    osdDemoShoutShuffle();
+    memset(shoutFb, 0, sizeof(shoutFb));
+    shoutWordCount = 0;
+    shoutBeatNo = 0;
+    shoutNewest = -1;
+    memset(shoutBarQ8, 0, sizeof(shoutBarQ8));
+#ifdef OSD_DEMO_CHIPTUNE
+    shoutLastPulse = chiptuneGetLinePulse();
+#endif
+#ifdef OSD_DEMO_CHIPTUNE
+    shoutLineAcc = 0;
+#endif
+    shoutLastBeatMs = millis();
+    shoutBeatPending = true; // first name right away
+    shoutBounceT = OSD_DEMO_SHOUT_BOUNCE_FIELDS + OSD_DEMO_SHOUT_REBOUND_FIELDS;
+    shoutBlinkBlack = false;
+    memset(shoutRowWhite, 0xFF, sizeof(shoutRowWhite)); // force the first gradient write
+    shoutArmed = true;
+}
+
+// --- Scene 10: scene 7's plasma on an interrupt engine (no busy-wait) ----------------------
+// Same video model, planner, encoder and race-the-beam windows as scene 7, but nothing spins:
+//  - TIM5 compare interrupts fire at each event (VSYNC window, field phase, every band start);
+//  - each band's burst is planned + encoded at the end of the previous band's interrupt and
+//    sent from its own interrupt (TX-only polled SPI, IRQs masked for the burst only);
+//  - the plasma masks for a whole frame are built by the normal OSD task into a double buffer;
+//  - VSYNC is predicted from the measured field period and polled only in a short window.
+// The scheduler, CLI and USB keep running in between. SPI2 TX DMA is not usable on this board
+// (DMA1 Stream4 belongs to motor 1 DShot), hence a polled burst inside the interrupt.
+#if defined(STM32F4)
+#define OSD_DEMO_IRQ_ENGINE
+#endif
+
+#ifdef OSD_DEMO_IRQ_ENGINE
+
+typedef enum {
+    IRQ_EV_VSYNC = 0, // poll STAT for the VSYNC edge (window opened just before the prediction)
+    IRQ_EV_PHASE,     // HSYNC phase + parity in VBLANK, frame swap, band-0 preload, first band
+    IRQ_EV_BAND,      // send the prepared band, prepare + schedule the next
+} osdDemoIrqEvent_e;
+
+static const timerHardware_t osdDemoIrqTimHw = {
+    .tim = (timerResource_t *)TIM5,
+    .tag = IO_TAG_NONE,
+    .channel = TIM_Channel_1,
+};
+static timerEdgeHandlerRec_t osdDemoIrqEdgeRec;
+static bool plasmaIrqArmed;          // scene 10 running (ISR chain alive)
+static volatile uint8_t irqEvent;
+static uint8_t irqMasks[2][OSD_DEMO_CHECKER_ROWS][OSD_DEMO_PLASMA2X2_BANDS][OSD_DEMO_CHECKER_COLS];
+static volatile uint8_t irqPlay;     // mask buffer being displayed
+static volatile bool irqNextReady;   // the other buffer holds a complete new frame
+static uint8_t irqCols;
+static uint8_t irqRows;
+static uint8_t irqY;
+static uint8_t irqB;
+static uint8_t irqYPre;
+static uint32_t irqEdge;
+static uint32_t irqPivot;
+static uint32_t irqRow0;
+static uint32_t irqLineQ16;
+static uint32_t irqLineTicks;
+static uint32_t irqTimRatioQ16;      // TIM5 ticks per DWT tick, Q16
+static bool irqHaveBurst;
+static osdDemoMgBurst_t irqBurst;
+// Stats (twstat): CPU time inside the ISR and in the frame-building task, late wake-ups.
+static uint64_t irqIsrTicks;  // 64-bit: 40 % of 108 MHz overflows 32 bits in ~100 s
+static uint64_t irqTaskTicks;
+static uint32_t irqLateUs;           // worst wake-up lateness vs the planned start
+static uint32_t irqVsyncMiss;
+static uint16_t irqVsyncLeadUs = OSD_DEMO_IRQ_VSYNC_LEAD_US; // widened after a miss
+
+static void osdDemoIrqArm(uint32_t dwtAt)
+{
+    TIM_TypeDef *tim = TIM5;
+    int32_t d = (int32_t)(dwtAt - getCycleCounter());
+    const int32_t minLead = (int32_t)clockMicrosToCycles(1);
+    if (d < minLead) {
+        d = minLead; // already due: fire as soon as possible
+    }
+    const uint32_t dt = (uint32_t)(((uint64_t)(uint32_t)d * irqTimRatioQ16) >> 16);
+    tim->SR = (uint16_t)~TIM_IT_CC1;
+    tim->CCR1 = tim->CNT + dt;
+}
+
+static void osdDemoIrqScheduleVsync(void)
+{
+    // Open the STAT window a little before the predicted edge (field period from TrackLine).
+    const uint32_t field = (mgFieldLastTicks != 0u)
+        ? mgFieldLastTicks : clockMicrosToCycles(OSD_DEMO_IRQ_NOMINAL_FIELD_US);
+    irqEvent = IRQ_EV_VSYNC;
+    osdDemoIrqArm(irqEdge + field - clockMicrosToCycles(irqVsyncLeadUs));
+}
+
+// Prepare the burst for (irqY, irqB) and arm its start; advances past empty / infeasible bands.
+static void osdDemoIrqPrepareNext(void)
+{
+    for (;;) {
+        if (irqY >= irqRows) {
+            irqHaveBurst = false;
+            osdDemoIrqScheduleVsync();
+            return;
+        }
+        const uint16_t dueLine = (uint16_t)((uint16_t)irqY * OSD_DEMO_CELL_H
+                                            + (uint16_t)irqB * OSD_DEMO_PLASMA2X2_STEP);
+        const uint32_t hsyncPrev = irqPivot + (uint32_t)(osdDemoMgLineOffset((uint16_t)(dueLine - 1u), irqLineQ16)
+                                                         + mgHsyncPhase);
+        const uint8_t *glyphs = irqMasks[irqPlay][irqY][irqB];
+        const uint8_t y = irqY;
+        // Advance the cursor to the following band now.
+        if (++irqB >= OSD_DEMO_PLASMA2X2_BANDS) {
+            irqY++;
+            irqB = (irqY < irqYPre) ? 1u : 0u;
+        }
+        if (!osdDemoMgChasePrepare(y, glyphs, irqCols, hsyncPrev, irqLineTicks, &irqBurst)) {
+            continue; // nothing changed in this band
+        }
+        if ((int32_t)(irqBurst.latest - irqBurst.startAt) < 0) {
+            mgStatSkips++;
+            continue;
+        }
+        irqHaveBurst = true;
+        irqEvent = IRQ_EV_BAND;
+        osdDemoIrqArm(irqBurst.startAt);
+        return;
+    }
+}
+
+static void osdDemoIrqVsync(void)
+{
+    uint32_t edge = 0;
+    max7456MidGlyphSpiBoost(false);
+    if (max7456WaitVsyncFallingEdge(&edge, (timeUs_t)irqVsyncLeadUs + OSD_DEMO_IRQ_VSYNC_WINDOW_US)) {
+        osdDemoMgTrackLinePeriod(edge, clockMicrosToCycles(OSD_DEMO_PAL_LINE_US));
+        irqVsyncLeadUs = OSD_DEMO_IRQ_VSYNC_LEAD_US;
+    } else {
+        // Lost it: dead-reckon one field and look again next time with a wider window
+        // (doubling up to ~4 ms) so the lock comes back in a field or two.
+        irqVsyncMiss++;
+        irqVsyncLeadUs = (uint16_t)MIN((uint32_t)irqVsyncLeadUs * 2u, (uint32_t)OSD_DEMO_IRQ_VSYNC_LEAD_MAX_US);
+        edge = irqEdge + ((mgFieldLastTicks != 0u)
+            ? mgFieldLastTicks : clockMicrosToCycles(OSD_DEMO_IRQ_NOMINAL_FIELD_US));
+        mgLastEdgeTicks = 0;
+    }
+    irqEdge = edge;
+    mgStatFields++;
+    irqLineQ16 = mgLineQ16;
+    irqLineTicks = irqLineQ16 >> 16;
+    irqPivot = edge + clockMicrosToCycles(OSD_DEMO_PAL_VBLANK_US + OSD_DEMO_MG_PIVOT_LINE * OSD_DEMO_PAL_LINE_US)
+        + (uint32_t)(int32_t)((int32_t)mgShiftUs * (int32_t)clockMicrosToCycles(1));
+    irqRow0 = irqPivot + (uint32_t)osdDemoMgLineOffset(0, irqLineQ16);
+    irqEvent = IRQ_EV_PHASE;
+    osdDemoIrqArm(irqRow0 - (uint32_t)OSD_DEMO_MG_FIELD_PHASE_LINES * irqLineTicks - irqLineTicks * 3u / 8u);
+}
+
+static void osdDemoIrqPhase(void)
+{
+    // MeasureFieldPhase waits until its own window (we are already there) and polls HSYNC.
+    osdDemoMgMeasureFieldPhase(irqEdge, irqRow0, irqLineTicks);
+    const bool frameStart = (twisterPairParity == OSD_DEMO_TWISTER_PAIR_OFF)
+        || (mgFieldFirst == (twisterPairParity == 0u));
+    if (frameStart && irqNextReady) {
+        irqPlay ^= 1u;   // a new frame on the field that starts it (both fields identical)
+        irqNextReady = false;
+    }
+    max7456MidGlyphSpiBoost(true);
+
+    // VBLANK preload of band 0 for as many rows as fit.
+    const uint32_t fullRowTicks = mgBurstFixedTicks
+        + (((10u + 2u * (uint32_t)irqCols) * mgByteTicksQ8) >> 8);
+    irqYPre = 0;
+    for (; irqYPre < irqRows; irqYPre++) {
+        if ((int32_t)(getCycleCounter() - (irqRow0 - fullRowTicks)) > 0) {
+            break;
+        }
+        (void)osdDemoMgWriteRow(irqYPre, irqMasks[irqPlay][irqYPre][0], 0, irqCols, 0, false, true);
+    }
+    irqY = 0;
+    irqB = (irqYPre > 0u) ? 1u : 0u;
+    osdDemoIrqPrepareNext();
+}
+
+static void osdDemoIrqBand(void)
+{
+    if (irqHaveBurst) {
+        // Timer wake-up lands a few us before/after startAt; never start early.
+        const int32_t late = (int32_t)(getCycleCounter() - irqBurst.startAt);
+        if (late > 0) {
+            const uint32_t us = (uint32_t)late / clockMicrosToCycles(1);
+            if (us > irqLateUs) {
+                irqLateUs = us;
+            }
+        }
+        osdDemoWaitCycles(irqBurst.startAt);
+        if (!osdDemoMgBurstSend(&irqBurst)) {
+            mgStatSkips++;
+            if (irqBurst.row < OSD_DEMO_MG_ROWS_MAX && mgStatSkipRow[irqBurst.row] < UINT16_MAX) {
+                mgStatSkipRow[irqBurst.row]++;
+            }
+        }
+    }
+    osdDemoIrqPrepareNext();
+}
+
+static void osdDemoIrqIsr(timerEdgeHandlerRec_t *cbRec, captureCompare_t capture)
+{
+    UNUSED(cbRec);
+    UNUSED(capture);
+    if (!plasmaIrqArmed) {
+        return;
+    }
+    const uint32_t t0 = getCycleCounter();
+    switch (irqEvent) {
+    case IRQ_EV_VSYNC:
+        osdDemoIrqVsync();
+        break;
+    case IRQ_EV_PHASE:
+        osdDemoIrqPhase();
+        break;
+    default:
+        osdDemoIrqBand();
+        break;
+    }
+    irqIsrTicks += getCycleCounter() - t0;
+}
+
+static void osdDemoPlasmaIrqBuild(uint8_t buf)
+{
+    plasmaPhase++;
+    osdDemoPlasma2x2BuildLuts(irqCols, irqRows, plasmaPhase);
+    uint8_t packs[OSD_DEMO_CHECKER_COLS];
+    for (uint8_t y = 0; y < irqRows; y++) {
+        for (uint8_t b = 0; b < OSD_DEMO_PLASMA2X2_BANDS; b++) {
+            osdDemoPlasma2x2BuildMasks(y, b, irqCols, irqMasks[buf][y][b], packs);
+        }
+    }
+}
+
+// OSD task side: build the next frame's masks whenever the ISR has taken the previous one.
+static void osdDemoPlasmaIrqTask(void)
+{
+    if (!plasmaIrqArmed || irqNextReady) {
+        return;
+    }
+    const uint32_t t0 = getCycleCounter();
+    osdDemoPlasmaIrqBuild((uint8_t)(irqPlay ^ 1u));
+    __DSB();
+    irqNextReady = true;
+    irqTaskTicks += getCycleCounter() - t0;
+}
+
+static void osdDemoPlasmaIrqStop(void)
+{
+    if (!plasmaIrqArmed) {
+        return;
+    }
+    plasmaIrqArmed = false;
+    TIM_ITConfig(TIM5, TIM_IT_CC1, DISABLE);
+    timerChannelConfigCallbacks(&osdDemoIrqTimHw, NULL, NULL);
+    (void)max7456WriteVosOffsetNow(0);
+    max7456MidGlyphSpiEnd();
+#ifdef OSD_DEMO_CHIPTUNE
+    beeperPwmAySetIrqBoost(chiptuneSchedulerIsParked());
+#endif
+}
+
+static bool osdDemoPlasmaIrqStart(void)
+{
+    if (!demoDisplay) {
+        return false;
+    }
+    irqCols = MIN(demoDisplay->cols, OSD_DEMO_CHECKER_COLS);
+    irqRows = MIN(demoDisplay->rows, OSD_DEMO_CHECKER_ROWS);
+    if (mgBurstFixedTicks == 0) {
+        mgBurstFixedTicks = clockMicrosToCycles(OSD_DEMO_MG_BURST_FIXED_US);
+    }
+    if (mgByteTicksQ8 == 0) {
+        mgByteTicksQ8 = (clockMicrosToCycles(30) << 8) / 36u;
+    }
+
+    // First frame into buffer 0.
+    irqPlay = 0;
+    irqNextReady = false;
+    osdDemoPlasmaIrqBuild(0);
+
+    // TIM5: free-running 32-bit at the timer clock; CC1 = event time.
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM5, ENABLE);
+    TIM_TimeBaseInitTypeDef tb;
+    TIM_TimeBaseStructInit(&tb);
+    tb.TIM_Prescaler = 0;
+    tb.TIM_Period = 0xFFFFFFFFu;
+    tb.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM5, &tb);
+    TIM_OCInitTypeDef oc;
+    TIM_OCStructInit(&oc);
+    oc.TIM_OCMode = TIM_OCMode_Timing;
+    TIM_OC1Init(TIM5, &oc);
+    TIM_Cmd(TIM5, ENABLE);
+    irqTimRatioQ16 = (uint32_t)(((uint64_t)timerClock(&osdDemoIrqTimHw) << 16)
+                                / ((uint64_t)clockMicrosToCycles(1) * 1000000u));
+
+    // Above the audio IRQ (dropped to timer priority while we run) and gyro-level otherwise.
+#ifdef OSD_DEMO_CHIPTUNE
+    beeperPwmAySetIrqBoost(false);
+#endif
+    NVIC_InitTypeDef nvic;
+    nvic.NVIC_IRQChannel = TIM5_IRQn;
+    nvic.NVIC_IRQChannelPreemptionPriority = NVIC_PRIORITY_BASE(NVIC_PRIO_MAX);
+    nvic.NVIC_IRQChannelSubPriority = NVIC_PRIORITY_SUB(NVIC_PRIO_MAX);
+    nvic.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&nvic);
+
+    max7456MidGlyphSpiBegin();
+    // One blocking VSYNC lock to seed the prediction; from then on only short windows.
+    uint32_t edge = 0;
+    if (!max7456WaitVsyncFallingEdge(&edge, OSD_DEMO_PAL_VSYNC_TIMEOUT_US)) {
+        max7456MidGlyphSpiEnd();
+        return false;
+    }
+    mgLastEdgeTicks = 0;
+    osdDemoMgTrackLinePeriod(edge, clockMicrosToCycles(OSD_DEMO_PAL_LINE_US));
+    irqEdge = edge;
+    irqIsrTicks = 0;
+    irqTaskTicks = 0;
+    irqLateUs = 0;
+    irqVsyncMiss = 0;
+    irqVsyncLeadUs = OSD_DEMO_IRQ_VSYNC_LEAD_US;
+
+    plasmaIrqArmed = true;
+    osdDemoIrqScheduleVsync(); // arm CC1 first, then enable its interrupt (no stale match)
+    timerChannelEdgeHandlerInit(&osdDemoIrqEdgeRec, osdDemoIrqIsr);
+    timerChannelConfigCallbacks(&osdDemoIrqTimHw, &osdDemoIrqEdgeRec, NULL);
+    return true;
+}
+
+void osdDemoPlasmaIrqGetStats(uint64_t *isrTicks, uint64_t *taskTicks, uint32_t *lateUs,
+                              uint32_t *vsyncMiss, bool reset)
+{
+    *isrTicks = irqIsrTicks;
+    *taskTicks = irqTaskTicks;
+    *lateUs = irqLateUs;
+    *vsyncMiss = irqVsyncMiss;
+    if (reset) {
+        irqIsrTicks = 0;
+        irqTaskTicks = 0;
+        irqLateUs = 0;
+        irqVsyncMiss = 0;
+    }
+}
+
+#else // !OSD_DEMO_IRQ_ENGINE
+
+static bool plasmaIrqArmed;
+static void osdDemoPlasmaIrqTask(void) {}
+static void osdDemoPlasmaIrqStop(void) { plasmaIrqArmed = false; }
+static bool osdDemoPlasmaIrqStart(void) { return false; }
+void osdDemoPlasmaIrqGetStats(uint64_t *isrTicks, uint64_t *taskTicks, uint32_t *lateUs,
+                              uint32_t *vsyncMiss, bool reset)
+{
+    UNUSED(reset);
+    *isrTicks = *taskTicks = *lateUs = *vsyncMiss = 0;
+}
+
+#endif // OSD_DEMO_IRQ_ENGINE
+
 
 
 // ---------------------------------------------------------------------------
@@ -2820,25 +3797,26 @@ static bool osdDemoMgWriteRow(uint8_t row, const uint8_t *glyphs, uint8_t winL, 
 // Race the beam: start right behind the beam in line (due−1) and require every cell to land
 // before the beam reaches it in line `due`. Per cell that is a whole line of window no matter
 // how long the burst is — a full 30-cell row fits, while "finish the burst inside the previous
-// line" (≈57 us) never can. SPI (~1.3–2.5 us/cell) is slower than the beam (~1.8 us/cell) or
-// close to it, so once behind the beam the writer stays behind; segment landing times are
-// taken from the exact encoded byte offsets.
-// No IRQ masking here: a burst can be long and the 16 kHz audio IRQ must keep running; the
-// remaining slack absorbs it.
-static bool osdDemoMgWriteRowChase(uint8_t row, const uint8_t *glyphs, uint8_t cols,
-                                   uint32_t hsyncPrev, uint32_t lineTicks)
+// line" (≈57 us) never can. Segment landing times come from the exact encoded byte offsets.
+// Every cell must land after the beam left it in line due−1 and before the beam reaches it in
+// line `due`; within one segment the writer moves at a constant rate (AI ~2 B/cell can be
+// faster than the beam, singles ~4 B/cell slower), so its two end cells bound it. Result: a
+// start window [startAt, latest] for the burst.
+
+// Plan + encode one band (into the driver's burst buffer) and compute its start window.
+// Returns false when nothing changed (no burst).
+static bool osdDemoMgChasePrepare(uint8_t row, const uint8_t *glyphs, uint8_t cols,
+                                  uint32_t hsyncPrev, uint32_t lineTicks, osdDemoMgBurst_t *bu)
 {
-    max7456SramSeg_t seg[OSD_DEMO_CHARS_PER_LINE];
     uint16_t segLast[OSD_DEMO_CHARS_PER_LINE];
-    const uint8_t nSeg = osdDemoMgPlanRow(row, glyphs, 0, cols, seg);
-    if (nSeg == 0) {
-        return true;
-    }
-    const uint16_t addr = (uint16_t)((uint16_t)row * (uint16_t)OSD_DEMO_CHARS_PER_LINE);
-    const uint16_t bytes = max7456EncodeDisplaySramRow(addr, glyphs, seg, nSeg, segLast);
-    if (bytes == 0) {
+    bu->row = row;
+    bu->glyphs = glyphs;
+    bu->nSeg = osdDemoMgPlanRow(row, glyphs, 0, cols, bu->seg);
+    if (bu->nSeg == 0) {
         return false;
     }
+    const uint16_t addr = (uint16_t)((uint16_t)row * (uint16_t)OSD_DEMO_CHARS_PER_LINE);
+    bu->bytes = max7456EncodeDisplaySramRow(addr, glyphs, bu->seg, bu->nSeg, segLast);
 
     const uint32_t cpu = clockMicrosToCycles(1);
     const uint32_t cellQ8 = (cpu * (uint32_t)OSD_DEMO_MG_BEAM_CELL_NS * 256u) / 1000u;
@@ -2847,61 +3825,64 @@ static bool osdDemoMgWriteRowChase(uint8_t row, const uint8_t *glyphs, uint8_t c
     const uint32_t byteT = mgByteTicksQ8; // Q8
     const uint32_t lineBeam = hsyncPrev + (uint32_t)x0; // first OSD pixel, line due−1
 
-    // Every cell must land after the beam left it in line due−1 and before the beam reaches
-    // it in line `due`. Within one segment the writer moves at a constant rate (AI ~2 B/cell
-    // can be faster than the beam, singles ~4 B/cell slower), so its two end cells bound it.
-    uint32_t startAt = 0;
-    bool startSet = false;
-    for (uint8_t i = 0; i < nSeg; i++) {
-        const uint8_t step = seg[i].autoInc ? 2u : 4u;
+    bool set = false;
+    for (uint8_t i = 0; i < bu->nSeg; i++) {
+        const uint8_t step = bu->seg[i].autoInc ? 2u : 4u;
         const uint16_t lastOff = segLast[i];
-        const uint16_t firstOff = (uint16_t)(lastOff - (uint16_t)step * (seg[i].len - 1u));
-        const uint8_t xs[2] = { seg[i].col, (uint8_t)(seg[i].col + seg[i].len - 1u) };
+        const uint16_t firstOff = (uint16_t)(lastOff - (uint16_t)step * (bu->seg[i].len - 1u));
+        const uint8_t xs[2] = { bu->seg[i].col, (uint8_t)(bu->seg[i].col + bu->seg[i].len - 1u) };
         const uint16_t offs[2] = { firstOff, lastOff };
         for (uint8_t e = 0; e < 2u; e++) {
+            const uint32_t land = mgBurstFixedTicks + (((uint32_t)offs[e] * byteT) >> 8);
             const uint32_t pass = lineBeam + (((uint32_t)(xs[e] + 1u) * cellQ8) >> 8) + margin;
-            const uint32_t need = pass - mgBurstFixedTicks - (((uint32_t)offs[e] * byteT) >> 8);
-            if (!startSet || (int32_t)(need - startAt) > 0) {
-                startAt = need;
-                startSet = true;
+            const uint32_t reach = lineBeam + lineTicks + (((uint32_t)xs[e] * cellQ8) >> 8) - margin;
+            const uint32_t need = pass - land;    // earliest start for this cell
+            const uint32_t limit = reach - land;  // latest start for this cell
+            if (!set || (int32_t)(need - bu->startAt) > 0) {
+                bu->startAt = need;
             }
+            if (!set || (int32_t)(limit - bu->latest) < 0) {
+                bu->latest = limit;
+            }
+            set = true;
         }
     }
-    osdDemoWaitCycles(startAt);
+    return bu->bytes != 0u;
+}
 
-    // Check + burst atomic (as in scene 8): an IRQ inside the burst would push its tail past
-    // the beam. With TX-only SPI the burst is ~30 us (≤ ~45 us), the audio IRQ just waits.
+// Send a prepared burst if it can still start inside its window (call at/after startAt).
+// Check + burst are atomic: an IRQ inside the burst would push its tail past the beam.
+static bool osdDemoMgBurstSend(const osdDemoMgBurst_t *bu)
+{
 #if defined(__CORTEX_M) // CMSIS core present
     const uint32_t primask = __get_PRIMASK();
     __disable_irq();
 #endif
     const uint32_t t0 = getCycleCounter();
-    bool fits = true;
-    for (uint8_t i = 0; i < nSeg && fits; i++) {
-        const uint8_t step = seg[i].autoInc ? 2u : 4u;
-        const uint16_t lastOff = segLast[i];
-        const uint16_t firstOff = (uint16_t)(lastOff - (uint16_t)step * (seg[i].len - 1u));
-        const uint8_t xs[2] = { seg[i].col, (uint8_t)(seg[i].col + seg[i].len - 1u) };
-        const uint16_t offs[2] = { firstOff, lastOff };
-        for (uint8_t e = 0; e < 2u; e++) {
-            const uint32_t land = t0 + mgBurstFixedTicks + (((uint32_t)offs[e] * byteT) >> 8);
-            const uint32_t reach = lineBeam + lineTicks + (((uint32_t)xs[e] * cellQ8) >> 8) - margin;
-            if ((int32_t)(reach - land) < 0) {
-                fits = false;
-                break;
-            }
-        }
-    }
-    const bool ok = fits && max7456SendEncodedDisplaySram(bytes);
+    const bool ok = (int32_t)(bu->latest - t0) >= 0 && max7456SendEncodedDisplaySram(bu->bytes);
     const uint32_t t1 = getCycleCounter();
 #if defined(__CORTEX_M) // CMSIS core present
     __set_PRIMASK(primask);
 #endif
-    if (!ok) {
+    if (ok) {
+        osdDemoMgCommit(bu->row, bu->glyphs, bu->seg, bu->nSeg, bu->bytes, t1 - t0);
+    }
+    return ok;
+}
+
+// Blocking engines (scenes 7, 9): prepare, wait for the beam, send.
+static bool osdDemoMgWriteRowChase(uint8_t row, const uint8_t *glyphs, uint8_t cols,
+                                   uint32_t hsyncPrev, uint32_t lineTicks)
+{
+    osdDemoMgBurst_t bu;
+    if (!osdDemoMgChasePrepare(row, glyphs, cols, hsyncPrev, lineTicks, &bu)) {
+        return true;
+    }
+    if ((int32_t)(bu.latest - bu.startAt) < 0) {
         return false;
     }
-    osdDemoMgCommit(row, glyphs, seg, nSeg, bytes, t1 - t0);
-    return true;
+    osdDemoWaitCycles(bu.startAt);
+    return osdDemoMgBurstSend(&bu);
 }
 
 // Once per field, in VBLANK (13 lines before the first OSD line, after the equalizing
@@ -3347,6 +4328,7 @@ void osdDemoTwisterGetStats(osdDemoTwisterStats_t *st, bool reset)
     st->cyclesPerUs = clockMicrosToCycles(1);
     st->fieldTicks = mgFieldLastTicks;
     st->idleTicks = mgStatIdleTicks;
+    st->windowMs = (uint32_t)(millis() - mgStatSinceMs);
     st->bytes = mgStatBytes;
     st->phaseField1 = mgHsyncPhaseBy[1];
     st->phaseField2 = mgHsyncPhaseBy[0];
@@ -3367,6 +4349,7 @@ void osdDemoTwisterGetStats(osdDemoTwisterStats_t *st, bool reset)
         memset(mgStatSkipRow, 0, sizeof(mgStatSkipRow));
         mgFieldReject = 0;
         mgStatIdleTicks = 0;
+        mgStatSinceMs = millis();
         mgStatBytes = 0;
         mgStatSlowBursts = 0;
 
@@ -3387,6 +4370,8 @@ static void osdDemoEnterFx(osdDemoFx_e next)
     punchArmed = false;
     plasma2x2Armed = false;
     twisterArmed = false;
+    shoutArmed = false;
+    osdDemoPlasmaIrqStop();
     memset(prevRowBright, 0xFF, sizeof(prevRowBright));
     max7456Invalidate();
     if (next == OSD_DEMO_FX_PLASMA) {
@@ -3494,6 +4479,26 @@ static void osdDemoEnterFx(osdDemoFx_e next)
         twisterBendFloat = 0;
         max7456WriteHosSigned(0);
         twisterArmed = true;
+    } else if (next == OSD_DEMO_FX_SHOUT) {
+        osdDemoShoutEnter();
+    } else if (next == OSD_DEMO_FX_PLASMA_IRQ) {
+        plasmaPhase = 0;
+        max7456Osdm(0x1B);
+        max7456Brightness(0, 3);
+        max7456SetBackgroundType(DISPLAY_BACKGROUND_BLACK);
+        max7456SetHudMotionOffset(0, 0);
+        (void)osdDemoWritePx22Glyphs();
+        max7456EndFontWrite();
+        if (demoDisplay) {
+            osdDemoFillRowsGlyphFast(demoDisplay->cols, demoDisplay->rows,
+                                     OSD_DEMO_PX22_BASE, OSD_DEMO_PX22_BASE);
+        }
+        memset(mgSram, 0xFF, sizeof(mgSram));
+        mgLastEdgeTicks = 0;
+        osdDemoMgResetStats();
+        if (!osdDemoPlasmaIrqStart()) {
+            startLastError = "scene10: interrupt engine unavailable on this MCU";
+        }
     } else {
         bounceStartMs = millis();
         prevBouncePhase = 0;
@@ -3504,7 +4509,7 @@ static void osdDemoEnterFx(osdDemoFx_e next)
     }
     // First frame of every scene: same vsync+SPI drain as the steady Update path.
     // Mid-glyph scenes own the chip directly — skip shadow flush.
-    if (next != OSD_DEMO_FX_PLASMA2X2 && next != OSD_DEMO_FX_TWISTER) {
+    if (!osdDemoFxIsMidGlyph(next)) {
         hosWrappedThisStep = false;
         osdDemoSyncFlush(true, true);
     }
@@ -3814,6 +4819,11 @@ bool osdDemoStart(void)
     max7456FillScreen(OSD_DEMO_PIXEL_OFF);
     osdDemoPaintScroller();
     max7456RefreshAll();
+#ifdef OSD_DEMO_CHIPTUNE
+    chiptuneSchedulerPark();
+    // Demo comes with music (scene 9 also takes its quarter notes from the tracker).
+    demoStartedChiptune = !chiptuneIsPlaying() && chiptuneStart(0);
+#endif
     return true;
 }
 
@@ -3830,6 +4840,8 @@ void osdDemoStop(void)
     active = false;
     plasma2x2Armed = false;
     twisterArmed = false;
+    shoutArmed = false;
+    osdDemoPlasmaIrqStop();
     punchY = 0;
     punchVel = 0;
     max7456MidGlyphSpiEnd();
@@ -3845,6 +4857,20 @@ void osdDemoStop(void)
         displayClearScreen(demoDisplay, DISPLAY_CLEAR_WAIT);
         demoDisplay = NULL;
     }
+#ifdef OSD_DEMO_CHIPTUNE
+    if (demoStartedChiptune) {
+        chiptuneStop();
+        demoStartedChiptune = false;
+    }
+    chiptuneSchedulerUnpark();
+#endif
+}
+
+// Scenes that own the chip through a DWT/VSYNC mid-glyph engine.
+static bool osdDemoFxIsMidGlyph(osdDemoFx_e f)
+{
+    return f == OSD_DEMO_FX_PLASMA2X2 || f == OSD_DEMO_FX_TWISTER || f == OSD_DEMO_FX_SHOUT
+        || f == OSD_DEMO_FX_PLASMA_IRQ;
 }
 
 static timeMs_t osdDemoFxDurationMs(osdDemoFx_e f)
@@ -3857,12 +4883,14 @@ static timeMs_t osdDemoFxDurationMs(osdDemoFx_e f)
     case OSD_DEMO_FX_TUNNEL:    return OSD_DEMO_FX_TUNNEL_MS;
     case OSD_DEMO_FX_PLASMA2X2: return OSD_DEMO_FX_PLASMA2X2_MS;
     case OSD_DEMO_FX_TWISTER:   return OSD_DEMO_FX_TWISTER_MS;
+    case OSD_DEMO_FX_SHOUT:     return OSD_DEMO_FX_SHOUT_MS;
+    case OSD_DEMO_FX_PLASMA_IRQ: return OSD_DEMO_FX_PLASMA_IRQ_MS;
     default:                    return OSD_DEMO_FX_SCROLLER_MS;
     }
 }
 
 // Auto-cycle order: 1 scroller → 2 plasma → 3 fire → 4 wipe → 5 tunnel → 7 plasma 2×2 →
-// 8 twister → back to 1.
+// 8 twister → 9 shoutouts → back to 1.
 static osdDemoFx_e osdDemoFxNext(osdDemoFx_e f)
 {
     switch (f) {
@@ -3872,19 +4900,21 @@ static osdDemoFx_e osdDemoFxNext(osdDemoFx_e f)
     case OSD_DEMO_FX_WIPE:      return OSD_DEMO_FX_TUNNEL;
     case OSD_DEMO_FX_TUNNEL:    return OSD_DEMO_FX_PLASMA2X2;
     case OSD_DEMO_FX_PLASMA2X2: return OSD_DEMO_FX_TWISTER;
+    case OSD_DEMO_FX_TWISTER:   return OSD_DEMO_FX_SHOUT;
     default:                    return OSD_DEMO_FX_SCROLLER;
     }
 }
 
-// CLI: run one scene permanently (1..5, 7, 8). Starts the demo if needed.
+// CLI: run one scene permanently (1..5, 7, 8, 9). Starts the demo if needed.
 bool osdDemoStartScene(uint8_t scene)
 {
-    static const int8_t sceneFx[9] = {
+    static const int8_t sceneFx[11] = {
         -1, OSD_DEMO_FX_SCROLLER, OSD_DEMO_FX_PLASMA, OSD_DEMO_FX_FIRE, OSD_DEMO_FX_WIPE,
-        OSD_DEMO_FX_TUNNEL, -1, OSD_DEMO_FX_PLASMA2X2, OSD_DEMO_FX_TWISTER,
+        OSD_DEMO_FX_TUNNEL, -1, OSD_DEMO_FX_PLASMA2X2, OSD_DEMO_FX_TWISTER, OSD_DEMO_FX_SHOUT,
+        OSD_DEMO_FX_PLASMA_IRQ,
     };
     if (scene >= ARRAYLEN(sceneFx) || sceneFx[scene] < 0) {
-        startLastError = "unknown scene (1..5, 7, 8)";
+        startLastError = "unknown scene (1..5, 7..10)";
         return false;
     }
     if (ARMING_FLAG(ARMED)) {
@@ -3898,7 +4928,9 @@ bool osdDemoStartScene(uint8_t scene)
     const osdDemoFx_e next = (osdDemoFx_e)sceneFx[scene];
     // Already running (re-issued from cliProcess inside the engine loop): just hold it.
     if (fx == next && ((next == OSD_DEMO_FX_TWISTER && twisterArmed)
-                       || (next == OSD_DEMO_FX_PLASMA2X2 && plasma2x2Armed))) {
+                       || (next == OSD_DEMO_FX_PLASMA2X2 && plasma2x2Armed)
+                       || (next == OSD_DEMO_FX_SHOUT && shoutArmed)
+                       || (next == OSD_DEMO_FX_PLASMA_IRQ && plasmaIrqArmed))) {
         return true;
     }
     osdDemoEnterFx(next);
@@ -3929,7 +4961,7 @@ void osdDemoUpdate(timeUs_t currentTimeUs)
             return;
         }
         // Held: mid-glyph engines run continuously; time-phased scenes loop on themselves.
-        if (fx != OSD_DEMO_FX_PLASMA2X2 && fx != OSD_DEMO_FX_TWISTER) {
+        if (!osdDemoFxIsMidGlyph(fx)) {
             const osdDemoFx_e same = fx;
             osdDemoEnterFx(same);
             return;
@@ -3951,6 +4983,23 @@ void osdDemoUpdate(timeUs_t currentTimeUs)
             return;
         }
         osdDemoTwisterEnginePoll();
+        return;
+    }
+    if (fx == OSD_DEMO_FX_SHOUT) {
+        if (ARMING_FLAG(ARMED)) {
+            osdDemoStop();
+            return;
+        }
+        osdDemoShoutEnginePoll();
+        return;
+    }
+    if (fx == OSD_DEMO_FX_PLASMA_IRQ) {
+        if (ARMING_FLAG(ARMED)) {
+            osdDemoStop();
+            return;
+        }
+        // Non-blocking: the ISR chain draws; the task only builds the next frame.
+        osdDemoPlasmaIrqTask();
         return;
     }
 

@@ -35,8 +35,11 @@ bool osdDemoIsActive(void);
 void osdDemoUpdate(timeUs_t currentTimeUs);
 
 // Run one scene permanently, no auto-cycle: 1 scroller, 2 plasma, 3 fire, 4 wipe, 5 tunnel,
-// 7 plasma 2×2, 8 twister. `osd_demo` / `play` returns to the cycle.
+// 7 plasma 2×2, 8 twister, 9 shoutouts, 10 plasma 2×2 on the interrupt engine. `osd_demo` / `play` returns to the cycle.
 bool osdDemoStartScene(uint8_t scene);
+// Scene 10 interrupt engine stats (CPU ticks inside the TIM5 ISR / frame task since reset).
+void osdDemoPlasmaIrqGetStats(uint64_t *isrTicks, uint64_t *taskTicks, uint32_t *lateUs,
+                              uint32_t *vsyncMiss, bool reset);
 bool osdDemoStartPlasma2x2(void); // scene 7 — 2×2 mid-glyph plasma
 // Scene 8 — classic vertical B/W ribbon twister (glyph width + HOS sway).
 bool osdDemoStartTwister(void);
@@ -50,7 +53,8 @@ typedef struct osdDemoTwisterStats_s {
     uint32_t cyclesPerUs;
     uint16_t skipRow[16];  // skips per character row — shows where on screen bands are lost
     uint32_t fieldTicks;   // last raw VSYNC→VSYNC
-    uint32_t idleTicks;    // total wait-for-beam ticks since last reset
+    uint64_t idleTicks;    // total wait-for-beam ticks since last reset
+    uint32_t windowMs;     // wall time since last reset (fields/s = fields·1000/windowMs)
     uint32_t bytes;        // total SPI bytes of all bursts since last reset
     int32_t phaseField1;   // HSYNC phase vs model, field 1 (ticks)
     int32_t phaseField2;   // same, field 2 — expect ~½ line apart

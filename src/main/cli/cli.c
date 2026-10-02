@@ -5048,7 +5048,8 @@ RAM_CODE static void cliOsdDemo(const char *cmdName, char *cmdline)
             cliPrintLine("  fx5 tunnel: Craft ray labyrinth");
             cliPrintLine("  scene7: 2x2 mid-glyph plasma (64 solid PX22)");
             cliPrintLine("  scene8: classic square-section twister (4 edges, WHITE|DITHER, HOS=0)");
-            cliPrintLine("  osd_demo sceneN / <name>: hold one scene (1-5,7,8), no auto-cycle");
+            cliPrintLine("  scene9: FPV shoutouts (3x3-px raster text on the beat)");
+            cliPrintLine("  osd_demo sceneN / <name>: hold one scene (1-5,7,8,9), no auto-cycle");
             cliPrintLine("  twstat: scene8 timing stats (skips per row, measured line/SPI)");
         } else {
             cliPrintLinef("osd_demo: failed — %s", osdDemoStartLastError());
@@ -5068,7 +5069,7 @@ RAM_CODE static void cliOsdDemo(const char *cmdName, char *cmdline)
         static const struct { const char *name; uint8_t scene; } sceneNames[] = {
             { "scene1", 1 }, { "scroller", 1 }, { "scene2", 2 }, { "plasma", 2 },
             { "scene3", 3 }, { "fire", 3 },     { "scene4", 4 }, { "wipe", 4 },
-            { "scene5", 5 }, { "tunnel", 5 },
+            { "scene5", 5 }, { "tunnel", 5 },   { "scene9", 9 }, { "shoutouts", 9 }, { "scene10", 10 }, { "plasmairq", 10 },
         };
         for (unsigned i = 0; i < ARRAYLEN(sceneNames); i++) {
             if (strcasecmp(cmd, sceneNames[i].name) == 0) {
@@ -5108,6 +5109,11 @@ RAM_CODE static void cliOsdDemo(const char *cmdName, char *cmdline)
         cliPrintLinef("mid-glyph: fields=%u writes=%u skips=%u avgBurst=%uB maxBurst=%uB",
                       (unsigned)st.fields, (unsigned)st.writes, (unsigned)st.skips,
                       (unsigned)(st.writes ? st.bytes / st.writes : 0), (unsigned)st.maxBytes);
+        if (st.windowMs > 0u) {
+            const uint32_t fps10 = (uint32_t)(((uint64_t)st.fields * 10000u) / st.windowMs);
+            cliPrintLinef("  fields/s=%u.%u (expect ~49: fewer = VSYNC edges / fields lost)",
+                          (unsigned)(fps10 / 10u), (unsigned)(fps10 % 10u));
+        }
         cliPrintLinef("  line=%u.%03u us (measured)  spi=%u ns/byte",
                       (unsigned)(lineNs / 1000u), (unsigned)(lineNs % 1000u), (unsigned)byteNs);
         cliPrintLinef("  field=%u us (raw) rejected=%u  hsync=%s miss=%u",
@@ -5116,11 +5122,23 @@ RAM_CODE static void cliOsdDemo(const char *cmdName, char *cmdline)
         if (st.fields && st.fieldTicks) {
             const uint64_t total = (uint64_t)st.fields * st.fieldTicks;
             cliPrintLinef("  idle=%u%% of field (waiting for the beam)  slow=%u",
-                          (unsigned)(((uint64_t)st.idleTicks * 100u) / total),
+                          (unsigned)((st.idleTicks * 100u) / total),
                           (unsigned)st.slowBursts);
         }
         cliPrintLinef("  hsync phase: field1=%d us field2=%d us",
                       (int)(st.phaseField1 / (int32_t)cpu), (int)(st.phaseField2 / (int32_t)cpu));
+        {
+            uint64_t isrT, taskT;
+            uint32_t lateUs, vmiss;
+            osdDemoPlasmaIrqGetStats(&isrT, &taskT, &lateUs, &vmiss, true);
+            if (isrT || taskT) {
+                const uint64_t total = (uint64_t)st.fields * (st.fieldTicks ? st.fieldTicks : 1u);
+                cliPrintLinef("  scene10 cpu: isr=%u%% task=%u%%  worst wake-up late=%u us  vsync miss=%u",
+                              (unsigned)((isrT * 100u) / total),
+                              (unsigned)((taskT * 100u) / total),
+                              (unsigned)lateUs, (unsigned)vmiss);
+            }
+        }
         cliPrintf("  drift/row us:");
         for (unsigned r = 0; r < ARRAYLEN(st.rowCorrTicks); r++) {
             const int32_t ns = (int32_t)((st.rowCorrTicks[r] * 1000) / (int32_t)cpu);
@@ -5235,7 +5253,7 @@ RAM_CODE static void cliOsdDemo(const char *cmdName, char *cmdline)
         return;
     }
 
-    cliPrintLine("usage: osd_demo <play|stop|scene1..5|scene7|scene8|twstat|twlines|twshift|twpair|twfreeze|twhsync|mgbeam>");
+    cliPrintLine("usage: osd_demo <play|stop|scene1..5|scene7|scene8|scene9|scene10|twstat|twlines|twshift|twpair|twfreeze|twhsync|mgbeam>");
 }
 
 #endif
@@ -8928,7 +8946,7 @@ const clicmd_t cmdTable[] = {
 #endif
 #ifdef USE_CHIPTUNE
     CLI_COMMAND_DEF("chiptune", "experimental piezo arpeggio player / dwell test", "[play|stop|test [dwellMs]|dwell <ms>]", cliChiptune),
-    CLI_COMMAND_DEF("osd_demo", "MAX7456 demoscene + mid-glyph plasma / twister", "play | stop | scene1..5 | scene7 | scene8 | twstat …", cliOsdDemo),
+    CLI_COMMAND_DEF("osd_demo", "MAX7456 demoscene + mid-glyph plasma / twister", "play | stop | scene1..5 | scene7..10 | twstat …", cliOsdDemo),
 #endif
 #ifdef USE_LED_STRIP_STATUS_MODE
         CLI_COMMAND_DEF("color", "configure colors", NULL, cliColor),

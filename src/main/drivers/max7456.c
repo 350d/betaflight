@@ -236,6 +236,7 @@ static uint8_t  videoSignalReg  = OSD_ENABLE; // OSD_ENABLE required to trigger 
 static uint8_t  displayMemoryModeReg = 0;
 
 static uint8_t  hosRegValue; // HOS (Horizontal offset register) value
+static bool midGlyphSpiHot; // a mid-glyph engine owns chip + bus (defined with its helpers below)
 static uint8_t  vosRegValue; // VOS (Vertical offset register) value
 
 // Transient HUD inertia offset in screen pixels (+x right, +y down). Not part of vcd base.
@@ -722,6 +723,13 @@ bool max7456ReInitIfRequired(bool forceStallCheck)
     static uint16_t reInitCount = 0;
     static timeMs_t lastStallCheckMs = MAX7456_STALL_CHECK_INTERVAL_MS / 2; // offset so that it doesn't coincide with the signal check
 
+    // A mid-glyph engine owns the chip and the bus (scene 10 bursts from a TIM5 interrupt while
+    // this runs in the OSD task): a VM0 read here could interleave with a raster burst, read
+    // garbage, "detect a stall" and re-init the chip mid-scene. Skip checks while hot.
+    if (midGlyphSpiHot) {
+        return false;
+    }
+
     const timeMs_t nowMs = millis();
 
     bool stalled = false;
@@ -1025,10 +1033,12 @@ static bool max7456WaitSpiIdle(void)
     if (!max7456DeviceDetected || fontIsLoading) {
         return false;
     }
-    // Finish any in-flight DMA segment before stealing the bus.
-    timeUs_t spinStart = micros();
+    // Finish any in-flight DMA segment before stealing the bus. DWT timeout: this also runs
+    // inside the scene-10 TIM5 interrupt, where micros() does not advance past 1 ms.
+    const uint32_t spinStart = getCycleCounter();
+    const uint32_t spinTicks = clockMicrosToCycles(5000);
     while (max7456ActiveDma || spiIsBusy(dev)) {
-        if (cmpTimeUs(micros(), spinStart) > 5000) {
+        if (getCycleCounter() - spinStart > spinTicks) {
             return false;
         }
     }
@@ -1505,6 +1515,26 @@ void max7456WriteHosNow(uint8_t hos)
     spiWriteReg(dev, MAX7456ADD_HOS, hos);
 }
 
+// Mid-glyph hot path: vertical shift relative to the configured base VOS, now (+ = down).
+// Returns the offset actually applied after clamping to the VOS range, so a raster engine
+// can move its line schedule by exactly that many lines.
+int8_t max7456WriteVosOffsetNow(int8_t offsetPx)
+{
+    const int vos = constrain((int)vosRegValue + (int)offsetPx, 0, 31);
+    if (!midGlyphSpiHot) {
+        if (!max7456WaitSpiIdle()) {
+            return (int8_t)(vos - (int)vosRegValue);
+        }
+    } else if (spiIsBusy(dev)) {
+        spiWait(dev);
+    }
+    if (vos != previousVosRegister) {
+        previousVosRegister = (uint8_t)vos;
+        spiWriteReg(dev, MAX7456ADD_VOS, (uint8_t)vos);
+    }
+    return (int8_t)(vos - (int)vosRegValue);
+}
+
 void max7456WriteHosSigned(int8_t offsetPx)
 {
     // Register center 32 == neutral. Clamp BEFORE encode — never wrap 0↔63.
@@ -1543,12 +1573,15 @@ bool max7456WaitVsyncFallingEdge(uint32_t *edgeTicks, timeUs_t timeoutUs)
         return false;
     }
 
-    const timeUs_t t0 = micros();
+    // DWT, not micros(): these run inside the scene-10 TIM5 interrupt, where SysTick cannot
+    // fire — micros() then wraps back every 1 ms and a >1 ms timeout never expired (hang).
+    const uint32_t t0 = getCycleCounter();
+    const uint32_t timeoutTicks = clockMicrosToCycles(timeoutUs);
     uint8_t prev = spiReadRegMsk(dev, MAX7456ADD_STAT);
 
     // Ensure we start from VSYNC high so the next 1→0 is a real edge.
     while (!STAT_IS_VSYNC_HIGH(prev)) {
-        if (cmpTimeUs(micros(), t0) > (timeDelta_t)timeoutUs) {
+        if (getCycleCounter() - t0 > timeoutTicks) {
             return false;
         }
         prev = spiReadRegMsk(dev, MAX7456ADD_STAT);
@@ -1564,7 +1597,7 @@ bool max7456WaitVsyncFallingEdge(uint32_t *edgeTicks, timeUs_t timeoutUs)
             return true;
         }
         prev = s;
-        if (cmpTimeUs(micros(), t0) > (timeDelta_t)timeoutUs) {
+        if (getCycleCounter() - t0 > timeoutTicks) {
             return false;
         }
     }
@@ -1576,12 +1609,15 @@ bool max7456WaitHsyncFallingEdge(uint32_t *edgeTicks, timeUs_t timeoutUs)
         return false;
     }
 
-    const timeUs_t t0 = micros();
+    // DWT, not micros(): these run inside the scene-10 TIM5 interrupt, where SysTick cannot
+    // fire — micros() then wraps back every 1 ms and a >1 ms timeout never expired (hang).
+    const uint32_t t0 = getCycleCounter();
+    const uint32_t timeoutTicks = clockMicrosToCycles(timeoutUs);
     uint8_t prev = spiReadRegMsk(dev, MAX7456ADD_STAT);
 
     // Start from HSYNC high so the next 1→0 is a real line edge.
     while (!STAT_IS_HSYNC_HIGH(prev)) {
-        if (cmpTimeUs(micros(), t0) > (timeDelta_t)timeoutUs) {
+        if (getCycleCounter() - t0 > timeoutTicks) {
             return false;
         }
         prev = spiReadRegMsk(dev, MAX7456ADD_STAT);
@@ -1596,7 +1632,7 @@ bool max7456WaitHsyncFallingEdge(uint32_t *edgeTicks, timeUs_t timeoutUs)
             return true;
         }
         prev = s;
-        if (cmpTimeUs(micros(), t0) > (timeDelta_t)timeoutUs) {
+        if (getCycleCounter() - t0 > timeoutTicks) {
             return false;
         }
     }

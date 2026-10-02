@@ -7,12 +7,14 @@
 
 This is **not** a proposal to ship raster effects in flight builds. It is a timing / SPI / glyph technique demo.
 
-Two scenes use the technique:
+Four scenes use the technique:
 
-| Scene | CLI | What it shows |
-|---|---|---|
-| 7 | `osd_demo scene7` (`plasma2x2`) | Sine plasma on a full-screen **180×144** grid of 2×2 megapixels |
-| 8 | `osd_demo scene8` (`twister`) | Classic vertical square-section twister: 1-px edges, white / dither faces, 2-line bands |
+| Scene | CLI | Engine | What it shows |
+|---|---|---|---|
+| 7 | `osd_demo scene7` (`plasma2x2`) | blocking | Sine plasma on a full-screen **180×144** grid of 2×2 megapixels |
+| 8 | `osd_demo scene8` (`twister`) | blocking | Classic vertical square-section twister: 1-px edges, white / dither faces, 2-line bands |
+| 9 | `osd_demo scene9` (`shoutouts`) | blocking | FPV community names in a 5×5 font on a **120×96** grid of 3×3 pixels, on the beat, with 1-px AY "spectrum" bars at the screen edges |
+| 10 | `osd_demo scene10` (`plasmairq`) | **TIM5 interrupt** | Scene 7's plasma without busy-waiting — scheduler, CLI and USB keep running |
 
 ---
 
@@ -107,6 +109,51 @@ Engine entry points: `osdDemoPlasma2x2EnginePoll()` (scene 7), `osdDemoTwisterEn
 
 ---
 
+## Universal raster engine (scenes 7, 9, 10)
+
+A scene supplies only the band geometry (`bandLines × bands = 18`), a per-field hook (animation, whole-OSD VOS offset) and a per-band glyph builder; timing, HSYNC lock, SRAM mirror, burst planning and race-the-beam are shared.
+
+| | Logical pixel | Bands per char row | Glyphs | Screen |
+|---|---|---|---|---|
+| 2×2 (scenes 7, 10) | 2 px × 2 lines | 9 | 64 (6-column masks) | 180 × 144 |
+| 3×3 (scene 9) | 3 px × 3 lines | 6 | 16 (4-column masks) + 23 bar cells | 120 × 96 |
+
+The 3×3 grid fits the 5×5 font exactly: 5 bands of text + one 3-line gap band between text rows. Mid-glyph rewriting, not per-cell glyph variety, provides the resolution — so 16 NVM glyphs are enough for any text, graphics or horizon at that resolution.
+
+## Interrupt engine (scene 10)
+
+The blocking engines (7–9) own the CPU for the whole field. Scene 10 runs the same plasma from **TIM5 compare interrupts**:
+
+```
+TIM5 (32-bit, timer clock = DWT clock) — one compare event at a time:
+  VSYNC window  : poll STAT only ~0.3 ms around the edge predicted from the measured field
+                  period (window doubles after a miss until re-locked)
+  field phase   : HSYNC phase + field parity in VBLANK, frame swap, band-0 preload
+  each band     : send the burst prepared one band earlier (IRQs masked for the burst only),
+                  then plan + encode the next band and arm its race-the-beam start
+OSD task        : builds the next frame's masks into a double buffer (once per frame)
+```
+
+SPI2 TX DMA is not usable on this board (F411: DMA1 Stream 4 is motor 1's DShot and motor DMA must not change), so the burst is the TX-only polled transfer inside the interrupt. The interrupt sits at `NVIC_PRIO_MAX`, above the audio IRQs, so music no longer pushes bursts past the beam.
+
+**Measured on HAKRCF411D, PAL camera, chiptune playing (`osd_demo twstat`):**
+
+| | Scene 7 (blocking) | Scene 10 (interrupt) |
+|---|---|---|
+| Skipped bands | ~2.4 per field (audio IRQs preempt the busy-wait) | **0** over 5000+ fields |
+| Burst start accuracy | — | **≤ 1 us** worst wake-up lateness |
+| Fields per second | 49.0 | 49.0 |
+| CPU | 100 % (the field is a busy loop) | **≈ 56 %** (ISR ≈ 40 %, frame task ≈ 16 %) |
+| Scheduler / CLI / USB | stalled for the field | running |
+
+Pitfalls found on the way (all would bite any interrupt-driven OSD on Betaflight):
+
+1. **No `micros()` timeouts inside a high-priority ISR.** `micros()` depends on SysTick, which cannot run underneath; it wraps back every 1 ms and a > 1 ms timeout never expires → FC hang. All MAX7456 wait loops now time out on DWT.
+2. **Exclusive bus ownership.** `max7456ReInitIfRequired()` (OSD task heartbeat) read VM0 in the middle of a raster burst: the ISR spun 5 ms on a busy bus, or the read returned garbage → false "stall" → full chip re-init mid-scene (freeze, big glyphs, lost VSYNC lock). The check is skipped while a mid-glyph engine owns the chip.
+3. **SPI DMA streams are a board-level resource** — check them before planning a DMA design.
+
+Remaining CPU (estimated reductions, not yet implemented): mask build spread over task calls and sped up (16 % → ~7 %), band-0 preload split, encode in the task instead of the ISR → roughly 30–35 % for full-screen 2×2; 3×3 content is far sparser and should cost a few percent.
+
 ## Content
 
 **Scene 7 — plasma**
@@ -124,21 +171,26 @@ Rotating square cross-section → 4 projected edges → up to 2 front faces (whi
 
 ---
 
+**Scene 9 — shoutouts**
+
+Names appear at random free spots on each quarter note (beat from the PT3 tracker's line clock, 120 BPM without music), blink white/black every frame until the next one, crumble letter → `-` → `.` → gone after 8 beats, and the whole OSD bounces up via VOS on every beat (hop + small rebound, the line schedule moves with it). Row brightness (RB0–RB15) follows a gradient from the newest name's row. Columns 0 and 29 show a 16-band AY "spectrum" straight from the register frame (no FFT): each tone channel's period picks a half-octave band, its volume the bar length, ABC stereo (left A + ½B, right C + ½B), drawn as 1-px-resolution dither bar cells like the twister faces.
+
 ## How to try
 
 Disarmed FC, MAX7456/AT7456 OSD connected:
 
 ```text
-osd_demo            # auto-cycle 1 → 2 → 3 → 4 → 5 → 7 → 8 → 1
-osd_demo scene7     # hold one scene (also scene1..5, scene8, or by name: plasma2x2, twister, …)
-osd_demo twstat     # mid-glyph stats for the running scene (resets counters)
+osd_demo            # auto-cycle 1 → 2 → 3 → 4 → 5 → 7 → 8 → 9 → 1 (starts the chiptune if present)
+osd_demo scene7     # hold one scene (scene1..5, 7..10, or by name: plasma2x2, twister, shoutouts, plasmairq)
+osd_demo scene10    # same plasma on the interrupt engine — compare with scene7
+osd_demo twstat     # mid-glyph stats for the running scene (fields/s, skips, CPU of scene 10; resets)
 ```
 
 Live tuning / diagnostics while a mid-glyph scene runs: `twhsync 0|1` (row HSYNC re-lock), `twpair 0|1|off` (which field starts a frame), `twfreeze 0|1` (scene 8 still frame), `twshift <us>`, `twlines 312|312.5|313`, `mgbeam <us>` (HSYNC → first OSD pixel for race-the-beam, default 10).
 
 Relevant code:
 
-- `src/main/io/osd_demo.c` — engines, `osdDemoMg*` shared timing / planner / writers
+- `src/main/io/osd_demo.c` — engines (`osdDemoRasterEnginePoll`, `osdDemoTwisterEnginePoll`, scene 10 `osdDemoIrq*`), `osdDemoMg*` shared timing / planner / writers
 - `src/main/drivers/max7456.c` — `max7456EncodeDisplaySramRow`, `max7456SendEncodedDisplaySram`, TX-only burst, `max7456MidGlyphSpi*`, VSYNC/HSYNC STAT waits
 - `src/main/osd/osd_demo_glyphs.inc`, `osd_demo_font.inc` — PX22 bank and defines
 
@@ -159,13 +211,17 @@ Relevant code:
 | Late SPI start (`finishBy − burst`) | Most writes skipped → character-sized blocks |
 | STAT HSYNC lock per band | Too slow / jittery; once per char row is enough |
 | `uint8` phase via `>> 1` | Visible phase snap every ~5 s |
+| `micros()` timeouts in the raster ISR | Never expire (SysTick blocked) → FC hang on the first missed VSYNC |
+| OSD stall check running concurrently with ISR bursts | Garbage VM0 read → chip re-init mid-scene |
+| Justified text layout / HOS sway (scene 9) | Looked worse than random placement / a steady screen |
 
 ---
 
 ## Limits / honesty
 
-- Busy-loops the CPU for the duration of the effect (demoscene only; **disarmed**).
-- Masks IRQs for each burst (≤ ~45 us); fine for a demo, not acceptable next to flight control.
+- Scenes 7–9 busy-loop the CPU for the field; scene 10 does not, but still uses ≈ 56 % CPU for full-screen 2×2 — demoscene only, **disarmed**.
+- Masks IRQs for each burst (≤ ~45 us); fine for a demo, not acceptable next to flight control. A flight variant needs SPI DMA (another board / bus) or partial-screen raster rows.
+- SPI2 is shared with the blackbox flash on this board: during a raster field the bus is busy ~90 % of the time.
 - **PAL only** so far; the model is in lines, but NTSC row count / VBLANK are not wired up.
 - TX-only SPI path is STM32F4-only (others fall back to the generic polled transfer).
 - `mgbeam` (HSYNC → first OSD pixel) is an estimate from the datasheet's 360 px / ~53 us, not a measurement; race-the-beam tolerates roughly ±15 us.
@@ -181,6 +237,6 @@ Useful feedback:
 
 - Has anyone shipped mid-field Display-SRAM rewrites on MAX/AT7456 in production features?
 - Boards with HSYNC/VSYNC wired to an MCU timer input? Hardware timestamps would replace STAT polling.
-- Interest in a minimal “raster canvas” API (band callbacks on top of `osdDemoMg*`) vs one-off demos?
+- Interest in a minimal “raster canvas” API (band callbacks on top of `osdDemoMg*`, e.g. a 120×96 3×3 layer for horizon / graphs) vs one-off demos?
 
 Clips / captures of `osd_demo scene7` / `scene8` and `osd_demo twstat` output on other AT7456 boards are welcome — especially NTSC and F7/H7 SPI clocking.
