@@ -1,0 +1,10 @@
+logs/tap_validate1.bbl: 6 prompts, 31 taps found, arm/centre split 0.013 deg
+prompted \ classified:   arm 1   arm 2   arm 3   arm 4 battery  bottom  unsure
+     arm 1                  5       0       0       0       0       0       0
+     arm 2                  0       5       0       0       0       0       0
+     arm 3                  0       0       5       0       0       0       0
+     arm 4                  0       0       0       5       0       0       0
+   battery                  4       0       1       0       0       0       0
+    bottom                  0       0       0       5       0       0       0
+correct 20/30, unsure 0, wrong 10; taps outside prompt windows 1
+taps found per series (asked 5): arm 1 5, arm 2 5, arm 3 5, arm 4 5, battery 5, bottom 5

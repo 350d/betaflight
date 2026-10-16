@@ -1,0 +1,139 @@
+free window: 57 taps, labels {1: 12, 2: 12, 3: 10, 4: 14, 5: 3, 6: 6} (0 = unsure), arm/centre split 0.080 deg
+phase 1 taps (3910 Hz):
+  arm 1        12 taps: r 73/Q17, p 73/Q2, p 136/Q8, p 269/Q33, y 74/Q28, y 333/Q16
+  arm 2        12 taps: r 74/Q20, p 73/Q15, p 130/Q8, p 269/Q25, y 74/Q8
+  arm 3        10 taps: r 73/Q28, p 76/Q11, p 134/Q7, p 269/Q27, y 74/Q25, y 136/Q7, y 209/Q50, y 332/Q21
+  arm 4        14 taps: r 74/Q21, p 74/Q9, p 131/Q8, p 269/Q26, y 73/Q12, y 268/Q18, y 333/Q16
+  battery      3 taps: r 204/Q34, r 219/Q41, p 133/Q8, p 270/Q23, y 75/Q8, y 89/Q5, y 213/Q6, y 269/Q19, y 330/Q16
+  frame bottom 6 taps: r 203/Q19, r 219/Q19, p 133/Q8, p 270/Q24, y 89/Q5, y 270/Q23, y 330/Q17
+
+phase 2 session 1001: 15.0 s, input rms [28. 28. 28. 28.] units, rpm [8118. 8145. 8084. 8104.], rotation 135.2 Hz
+  roll: rotation lines at 134, 270 Hz (k x 135 Hz)
+  pitch: rotation lines at 134, 268 Hz (k x 135 Hz)
+  yaw: rotation lines at 134, 268 Hz (k x 135 Hz)
+  pitch motor 1:  204.2 Hz gain 0.113 Q 50 coh 0.95
+  roll  motor 1:  204.2 Hz gain 0.085 Q 35 coh 0.96
+  yaw   motor 1:  204.2 Hz gain 0.046 Q 51 coh 0.92
+  roll  motor 2:  205.1 Hz gain 0.078 Q 54 coh 0.94
+  pitch motor 2:  207.0 Hz gain 0.093 Q 36 coh 0.93
+  roll  motor 2:  208.9 Hz gain 0.089 Q 86 coh 0.91
+  yaw   motor 2:  208.9 Hz gain 0.064 Q 36 coh 0.90
+  pitch motor 3:  209.9 Hz gain 0.173 Q 59 coh 0.91
+  pitch motor 4:  209.9 Hz gain 0.160 Q 43 coh 0.91
+  roll  motor 1:  209.9 Hz gain 0.064 Q 23 coh 0.92
+  roll  motor 3:  209.9 Hz gain 0.103 Q 55 coh 0.92
+  roll  motor 4:  209.9 Hz gain 0.125 Q 44 coh 0.92
+  yaw   motor 3:  209.9 Hz gain 0.048 Q 40 coh 0.91
+  yaw   motor 4:  209.9 Hz gain 0.055 Q 34 coh 0.91
+  roll  motor 2:  228.0 Hz gain 0.046 Q 24 coh 0.95
+  pitch motor 2:  253.8 Hz gain 0.086 Q 51 coh 0.78
+  pitch motor 4:  253.8 Hz gain 0.104 Q 52 coh 0.78
+  pitch motor 3:  256.6 Hz gain 0.051 Q 173 coh 0.64
+  pitch motor 4:  256.6 Hz gain 0.114 Q 171 coh 0.64
+  pitch motor 1:  257.6 Hz gain 0.032 Q 188 coh 0.67
+  pitch motor 2:  257.6 Hz gain 0.102 Q 177 coh 0.67
+  yaw   motor 4:  260.4 Hz gain 0.048 Q 51 coh 0.61
+  pitch motor 4:  281.4 Hz gain 0.074 Q 219 coh 0.60
+  yaw   motor 1:  328.2 Hz gain 0.065 Q 100 coh 0.77
+  yaw   motor 3:  328.2 Hz gain 0.045 Q 115 coh 0.77
+  roll  motor 1:  329.1 Hz gain 0.032 Q 28 coh 0.77
+  yaw   motor 1:  331.0 Hz gain 0.051 Q 139 coh 0.70
+  yaw   motor 3:  333.0 Hz gain 0.041 Q 349 coh 0.62
+  pitch motor 2:  429.3 Hz gain 0.074 Q 42 coh 0.92
+  yaw   motor 2:  430.3 Hz gain 0.091 Q 59 coh 0.89
+  pitch motor 1:  433.1 Hz gain 0.133 Q 34 coh 0.89
+  yaw   motor 1:  433.1 Hz gain 0.102 Q 25 coh 0.89
+  pitch motor 3:  436.9 Hz gain 0.050 Q 322 coh 0.88
+  yaw   motor 2:  443.6 Hz gain 0.068 Q 211 coh 0.82
+  roll  motor 3:  445.5 Hz gain 0.040 Q 58 coh 0.77
+  yaw   motor 3:  445.5 Hz gain 0.136 Q 35 coh 0.85
+  yaw   motor 4:  445.5 Hz gain 0.141 Q 102 coh 0.85
+  roll  motor 2:  446.5 Hz gain 0.032 Q 133 coh 0.65
+  roll  motor 4:  446.5 Hz gain 0.036 Q 129 coh 0.65
+  roll  motor 4:  452.2 Hz gain 0.026 Q 375 coh 0.62
+  yaw   motor 4:  508.5 Hz gain 0.086 Q 16 coh 0.90
+  yaw   motor 2:  516.1 Hz gain 0.067 Q 19 coh 0.95
+  roll  motor 3:  693.6 Hz gain 0.036 Q 165 coh 0.69
+  pitch motor 1:  696.4 Hz gain 0.027 Q 170 coh 0.71
+  roll  motor 1:  696.4 Hz gain 0.033 Q 344 coh 0.75
+  roll  motor 4:  696.4 Hz gain 0.031 Q 307 coh 0.75
+  roll  motor 3:  706.9 Hz gain 0.038 Q 494 coh 0.79
+  command -> rpm at 20-40 Hz: [11.3 11.  11.  11.3] rpm/unit
+
+phase 2 session 1002: 15.0 s, input rms [27.5 27.6 27.6 27.4] units, rpm [14899. 14932. 14898. 14880.], rotation 248.4 Hz
+  pitch: rotation lines at 246 Hz (k x 248 Hz)
+  pitch motor 1:  204.2 Hz gain 0.135 Q 42 coh 0.92
+  roll  motor 2:  204.2 Hz gain 0.109 Q 25 coh 0.94
+  pitch motor 2:  205.1 Hz gain 0.130 Q 49 coh 0.90
+  roll  motor 1:  205.1 Hz gain 0.138 Q 41 coh 0.92
+  yaw   motor 3:  207.0 Hz gain 0.065 Q 51 coh 0.88
+  roll  motor 2:  208.0 Hz gain 0.115 Q 90 coh 0.91
+  yaw   motor 2:  208.0 Hz gain 0.088 Q 63 coh 0.92
+  pitch motor 3:  208.9 Hz gain 0.174 Q 50 coh 0.91
+  pitch motor 4:  208.9 Hz gain 0.213 Q 50 coh 0.91
+  roll  motor 3:  208.9 Hz gain 0.077 Q 51 coh 0.93
+  roll  motor 4:  208.9 Hz gain 0.131 Q 42 coh 0.93
+  roll  motor 2:  226.1 Hz gain 0.047 Q 22 coh 0.85
+  pitch motor 4:  236.6 Hz gain 0.108 Q 169 coh 0.63
+  roll  motor 4:  236.6 Hz gain 0.032 Q 181 coh 0.64
+  roll  motor 2:  237.6 Hz gain 0.042 Q 191 coh 0.70
+  pitch motor 1:  256.6 Hz gain 0.085 Q 113 coh 0.64
+  pitch motor 4:  257.6 Hz gain 0.177 Q 115 coh 0.67
+  pitch motor 2:  258.6 Hz gain 0.151 Q 108 coh 0.61
+  pitch motor 3:  258.6 Hz gain 0.066 Q 271 coh 0.61
+  pitch motor 3:  260.5 Hz gain 0.061 Q 273 coh 0.60
+  pitch motor 3:  265.2 Hz gain 0.129 Q 227 coh 0.73
+  yaw   motor 3:  265.2 Hz gain 0.047 Q 179 coh 0.73
+  yaw   motor 4:  265.2 Hz gain 0.080 Q 36 coh 0.73
+  pitch motor 2:  266.2 Hz gain 0.242 Q 38 coh 0.80
+  yaw   motor 2:  266.2 Hz gain 0.074 Q 26 coh 0.81
+  pitch motor 1:  269.0 Hz gain 0.088 Q 184 coh 0.78
+  pitch motor 4:  270.0 Hz gain 0.254 Q 41 coh 0.83
+  yaw   motor 3:  327.2 Hz gain 0.054 Q 117 coh 0.78
+  roll  motor 1:  329.2 Hz gain 0.036 Q 25 coh 0.84
+  yaw   motor 1:  329.2 Hz gain 0.064 Q 48 coh 0.67
+  roll  motor 1:  333.0 Hz gain 0.036 Q 172 coh 0.70
+  yaw   motor 1:  333.0 Hz gain 0.070 Q 349 coh 0.65
+  yaw   motor 2:  421.7 Hz gain 0.109 Q 27 coh 0.92
+  pitch motor 1:  422.7 Hz gain 0.154 Q 26 coh 0.92
+  yaw   motor 1:  423.6 Hz gain 0.113 Q 33 coh 0.92
+  pitch motor 2:  424.6 Hz gain 0.097 Q 33 coh 0.93
+  roll  motor 4:  433.1 Hz gain 0.029 Q 181 coh 0.72
+  yaw   motor 3:  435.1 Hz gain 0.129 Q 30 coh 0.92
+  roll  motor 3:  437.0 Hz gain 0.041 Q 25 coh 0.82
+  yaw   motor 4:  441.7 Hz gain 0.122 Q 30 coh 0.98
+  yaw   motor 4:  482.8 Hz gain 0.082 Q 84 coh 0.84
+  yaw   motor 1:  493.3 Hz gain 0.070 Q 517 coh 0.61
+  yaw   motor 2:  502.8 Hz gain 0.073 Q 67 coh 0.92
+  yaw   motor 4:  505.7 Hz gain 0.095 Q 20 coh 0.93
+  roll  motor 3:  710.8 Hz gain 0.033 Q 118 coh 0.68
+  roll  motor 4:  712.7 Hz gain 0.031 Q 273 coh 0.79
+  roll  motor 3:  718.4 Hz gain 0.038 Q 681 coh 0.74
+  roll  motor 1:  722.2 Hz gain 0.036 Q 757 coh 0.60
+  command -> rpm at 20-40 Hz: [12.7 12.6 12.6 13. ] rpm/unit
+
+mode summary:
+    74.2 Hz  Q~  15  frame (tap only)                              tap arm 1, tap arm 2, tap arm 3, tap arm 4, tap battery
+    88.8 Hz  Q~   5  centre / possibly grip                        tap battery, tap frame bottom
+   133.1 Hz  Q~   8  frame (tap only) / possibly grip / near a rotation harmonic tap arm 1, tap arm 2, tap arm 3, tap arm 4, tap battery, tap frame bottom
+   207.5 Hz  Q~  44  frame (tap + motors)                          motors base 1150, motors base 1300, tap arm 3, tap battery, tap frame bottom
+   218.6 Hz  Q~  30  centre                                        tap battery, tap frame bottom
+   227.1 Hz  Q~  23  motor-driven only (motor/bell-local?)         motors base 1150, motors base 1300
+   236.9 Hz  Q~ 181  one speed only (check rotation lines)         motors base 1300
+   257.4 Hz  Q~ 143  motor-driven only (motor/bell-local?)         motors base 1150, motors base 1300
+   268.2 Hz  Q~  27  frame (tap + motors) / near a rotation harmonic motors base 1300, tap arm 1, tap arm 2, tap arm 3, tap arm 4, tap battery, tap frame bottom
+   281.4 Hz  Q~ 219  one speed only (check rotation lines)         motors base 1150
+   330.7 Hz  Q~  48  frame (tap + motors)                          motors base 1150, motors base 1300, tap arm 1, tap arm 3, tap arm 4, tap battery, tap frame bottom
+   423.1 Hz  Q~  30  one speed only (check rotation lines)         motors base 1300
+   433.5 Hz  Q~  38  motor-driven only (motor/bell-local?)         motors base 1150, motors base 1300
+   445.0 Hz  Q~ 102  motor-driven only (motor/bell-local?)         motors base 1150, motors base 1300
+   452.2 Hz  Q~ 375  one speed only (check rotation lines)         motors base 1150
+   482.8 Hz  Q~  84  one speed only (check rotation lines)         motors base 1300
+   493.3 Hz  Q~ 517  one speed only (check rotation lines) / near a rotation harmonic motors base 1300
+   505.6 Hz  Q~  20  motor-driven only (motor/bell-local?)         motors base 1150, motors base 1300
+   516.1 Hz  Q~  19  one speed only (check rotation lines)         motors base 1150
+   695.7 Hz  Q~ 239  one speed only (check rotation lines)         motors base 1150
+   710.1 Hz  Q~ 273  motor-driven only (motor/bell-local?)         motors base 1150, motors base 1300
+   720.3 Hz  Q~ 719  one speed only (check rotation lines)         motors base 1300
+logs/full_free2.bbl: 0/0 correct, 0 unsure, arm/centre split 0.080 deg
+total: 0/0 correct (0 %), 0 unsure, 0 wrong
