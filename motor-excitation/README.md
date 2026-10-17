@@ -5,18 +5,24 @@ PID 4 kHz, blackbox to onboard flash at 1/1 or 1/2. Host scripts in `tools/`, fu
 
 ## 1. Which support gives the right answer
 
-Chirp 20-900 Hz on every motor, 3 repeats per support. The suspension is the reference.
+Chirp 20-900 Hz on every motor; the suspension (elastic) is the reference. Ranked best to worst, single pass each
+(repeat 1, so every support is compared the same way):
+
+| rank | support | suspended peaks reproduced | median freq error | front-arm mode (ref. 267-269 Hz) |
+|---|---|---|---|---|
+| 1 | suspended on elastic (reference; 1 pass vs 3) | 98 % | 0.4 Hz | 267-269 Hz |
+| 2 | held by the battery | 80 % | 1.0 Hz | 267-269 Hz |
+| 3 | inverted, battery on a kitchen sponge (hands-free) | 71 % | 1.5 Hz | 269 Hz, gain -1/3 |
+| 4 | upright on a kitchen sponge | 69 % | 1.7 Hz | 272-273 Hz, gain -1/2 |
+| 5 | flat on a table | 31 % | 2.0 Hz | not found (242 Hz) |
 
 ![supports](img/support_comparison.png)
 
-| support | suspended peaks reproduced | median freq error | median gain ratio | strongest mode per motor |
-|---|---|---|---|---|
-| table | 31 % | 1.9 Hz | 0.77 | 1 / 4 |
-| held by the battery | 76 % | 0.7 Hz | 1.01 | 4 / 4 |
-
-All three repeat equally well (freq spread < 1 Hz, gain spread 4-6 %), so repeatability alone hides the error:
-the table moves the front-arm mode 268 → 242 Hz and adds its own modes. Held by the battery is as good as the
-suspension for everything above ~200 Hz.
+Every support except the table finds the strongest resonance of every motor (4/4); they differ in how many of
+the weaker modes they find and how exactly. All of them repeat well run to run (freq spread < 1 Hz, gain spread
+4-6 %), so repeatability alone hides the error: the table shifts the front-arm mode and adds modes of its own.
+The battery grip is the default; the inverted sponge is the hands-free option. Not tested yet: hanging on a TPU
+rod, expected close to the elastic.
 
 ## 2. Tap test and auto-detect of the tapped point
 
