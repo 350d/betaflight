@@ -239,6 +239,36 @@ fixed by keeping the session alive while speaking.)
 - At base 1150 the 2nd rotation harmonic (270 Hz) lands on the 268 Hz frame mode; the second base separates them.
 - The 422-450 Hz group sits 5-10 Hz lower at 1300 than at 1150: rpm dependent, consistent with a rotor/bell mode.
 
+## Stage 4: kitchen sponge, chirp per motor x 3 (logs/stage4_sponge*, 2026-10-17)
+
+| support | suspended peaks reproduced | median freq error | median gain ratio | extra peaks | strongest mode |
+|---|---|---|---|---|---|
+| table | 31 % | 1.9 Hz | 0.77 | 30 | 1/4 |
+| held by the battery | 76 % | 0.7 Hz | 1.01 | 8 | 4/4 |
+| sponge | 71 % | 1.3 Hz | 0.92 | 17 | 4/4 |
+
+Same repeatability as the hand (freq sd 0.8 Hz, gain CV ~6 %). The front-arm mode moves 268 → 272-274 Hz and its
+gain halves (0.18 vs 0.39): the sponge loads the front arms. Decision rule from the user (sponge becomes the main
+support only if it beats the hand): not met, hand stays main, sponge is a fallback. Open: sponge under the body only,
+arms free. On a sponge the frame-bottom tap is replaced by a tap on the tail from above (point 7).
+
+## Stage 5: inverted, battery on the sponge, one pass (logs/stage5_sponge_inv*)
+
+Single-pass comparison (repeat 1 only for every support, `score_single.py`), reference = repeatable suspended peaks:
+
+| support | reproduced | median freq error | gain ratio | extra | front arms pitch |
+|---|---|---|---|---|---|
+| suspended, 1 pass vs 3 (ceiling) | 98 % | 0.4 Hz | 1.00 | 1 | 267-269 Hz, 0.37-0.38 |
+| held by the battery | 80 % | 1.0 Hz | 0.98 | 10 | 267-269 Hz, 0.38-0.41 |
+| inverted, battery on the sponge | 71 % | 1.5 Hz | 1.11 | 11 | 269 Hz, 0.25-0.26 |
+| upright on the sponge | 69 % | 1.7 Hz | 0.92 | 19 | 272-273 Hz, 0.18 |
+| table | 31 % | 2.0 Hz | 0.81 | 30 | - |
+
+Inverted beats upright (front-arm mode back at 269 Hz, half the extra peaks) but stays below the hand. User rule:
+hand stays the main support. Inverted-on-sponge is the hands-free option: nobody holds a craft with spinning
+motors, at the cost of ~9 % of the peaks and 0.5 Hz. One pass only (spread of this metric between passes ~4 %).
+(An idle ESC beacon after 10 min and a USB replug aborted the first attempt before any run.)
+
 ## Open
 
 - all three stages done; next candidate: soft support (foam / rubber bands) as the user-facing method,
