@@ -1,0 +1,5 @@
+state: idle | map, telemetry, backup | frames 0/60, fs 0 Hz
+current:  rpm weights 100/96/100 q 500, dyn notches 2, lpf1 0 (dyn min 0), lpf2 1000 Hz, notch1 359/330 Hz
+D-term / sweep (last applied tune (kept)): D x1.5, D now 112-225 / 225 Hz, P+D delay 1326 us (stock 2496), D input 174 %, noise 180 %
+  sweep done, amp 25 deg/s, crossover roll 15.6 Hz pitch 15.4 Hz, phase margin 36 / 35 deg
+  motor noise index 3.1 (chain now 4.9), ripple heat stock 0.21 K -> pick 0.70 K (budget +0.5 K); PID loop 0 / 4000 Hz
