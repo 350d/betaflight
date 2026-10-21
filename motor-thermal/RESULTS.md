@@ -294,3 +294,11 @@ and out of focus, so absolute temperatures read low; rises and time constants ar
 Committed as fdb4018d3 on #15848 and merged into #15851.
 
 ![three motors](pr-assets/scaling_three_motors_model_vs_camera.png)
+
+# Session 5, 2026-10-21: datasheet validation, prop wash, datasheet resistance
+
+Full write-up: [DATASHEET_VALIDATION.md](DATASHEET_VALIDATION.md). In short: 220 published full-throttle temperatures of
+9 brands showed the model 2.7x hot (median); the missing term was the prop wash over the motor (the bench motor had no
+prop). Forced convection with the turbulent h ∝ v^0.8 brings the median to 0.99 (IQR 0.64-1.57) and leaves the bench
+fit unchanged. The reference winding resistance is now the datasheet 0.070 Ω (the 0.2 Ω above was a multimeter
+reading); the datasheet idle current was tried as an input and dropped.
