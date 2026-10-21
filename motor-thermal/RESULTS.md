@@ -252,3 +252,45 @@ calibrates b, e on bell self-ventilation (5–12 m/s). Fit b 1.45, e 1.5 (upper 
 What-if with the same inputs: 5" prop at hover changes little (prop induced 4 m/s vs bell 11
 m/s), craft speed 10 m/s lowers the peak by 4 °C, 25 m/s by 8 °C. Above 12 m/s the
 convection law is extrapolated.
+
+# Session 4, 2026-10-21: three motors, size and magnet scaling
+
+Same method on two more motors: thermal camera on the windings (through the bell), 201 Hz sine
+injected on one motor by the MSP2 motor excitation firmware (#15851), base command 1150, 4S,
+180 s runs. A second motor ran a prop at 1100 throughout to cool the VTX/air unit.
+
+| motor | stator | magnets | rpm at 1150 | ROI | noise rise | baseline plateau over ambient |
+|---|---|---|---|---|---|---|
+| X-NOVA 2203.5 2800KV (reference) | 22×3.5 | 14 | 7 500 | windings, side view | ±50: +10 K | +11 K |
+| GEPRC 1408 3500KV (3", closed bell, HAKRCF411D) | 14×8 | 12 | 10 200 | 128,96,16,16 (slot) | ±20: +1.6 K, ±30: +3.9 K | +21 K |
+| XING 1204 4500KV (A75 whoop, IFLIGHT_F411_PRO) | 12×4 | 12 | 11 900 | 112,104,16,16 | ±25: +1.4 K, ±40: +4.1 K | ≈ +25 K (next to the VTX) |
+
+- Noise heating still follows the command variance (rise ratio ≈ variance ratio on both motors).
+- Small motors: the old laws over-estimated the noise heating up to 5× (1408) and 11× (1204), and
+  under-estimated the no-load heating and its speed (time constants 0.5–1 min).
+- Cooling prop on another motor: the resting test motor cools 3–4× faster (1408: τ 435 s → 104–151 s);
+  a spinning test motor barely changes (1204 base: T∞ 56.5 °C without, 53.8 °C with). Both motors got
+  a no-airflow segment so that the fit can separate airflow from heat capacity.
+- Bus current is a weak check on these boards (1408: 0.36 / 0.67 W excess; whoop AIO: 0.06–0.09 W).
+
+Joint fit (scaling_fit.py; reference constants fixed, all ratios 1 at the reference):
+
+| term | before | after |
+|---|---|---|
+| ripple copper loss, winding resistance | ∝ H | ∝ H·D^2.5 |
+| no-load loss at a given rpm | ∝ D²·H | ∝ D^0.15·H^0.25 · magnets/14 |
+| heat capacity | ∝ D²·H | ∝ D²·(H + 12 mm) |
+| thermal resistances | ∝ 1/ratio | ∝ 1/√ratio |
+
+| data set | RMSE before | RMSE after |
+|---|---|---|
+| 2203.5 rand1 / rand2 / flight1 / flight2 | 1.25 / 1.10 / 0.78 / 1.22 °C | unchanged |
+| 1408 pack (cooling prop) / no airflow | 5.36 / 2.41 °C | 1.20 / 1.16 °C |
+| 1204 pack (cooling prop) / no airflow | 9.13 / 6.37 °C | 1.07 / 1.17 °C |
+
+Limits: three motors, 12–22 mm stators; both new motors have 12 magnets, so the magnet term is set
+by physics (linear in electrical frequency), not fitted. The camera sees the windings through the bell
+and out of focus, so absolute temperatures read low; rises and time constants are not affected.
+Committed as fdb4018d3 on #15848 and merged into #15851.
+
+![three motors](pr-assets/scaling_three_motors_model_vs_camera.png)
