@@ -15,12 +15,21 @@ import matplotlib.pyplot as plt
 
 
 def point(path):
+    """D x10, P+D delay ms, stock delay ms, added ripple heat (host model units) of the decision in a status dump."""
     p = open(path, "rb").read()
     n = len(p)
     delay, delay_ref = struct.unpack_from("<HH", p, n - 53)
-    noise = p[n - 48]
-    mult = p[n - 60]
-    return noise, delay / 1000, delay_ref / 1000, mult / 10
+    heat_ref, heat = struct.unpack_from("<HH", p, n - 31)
+    return p[n - 60] / 10, delay / 1000, delay_ref / 1000, (heat - heat_ref) / 100
+
+
+def front(points):
+    """The least delay for each heat: sorted by heat, only points that lower the delay."""
+    out = []
+    for h, d in sorted(points):
+        if not out or d < out[-1][1] - 1e-6:
+            out.append((h, d))
+    return out
 
 
 def main():
@@ -29,22 +38,26 @@ def main():
     fig, ax = plt.subplots(figsize=(8.5, 5))
     colours = ["#7fb3ff", "#ffb347", "#9be37f"]
     marks = [("Low noise", "s"), ("Balanced", "o"), ("Low delay", "^")]
+    scale = None
     for (spec, col) in zip(sys.argv[2:], colours):
         prefix, label = spec.split(":", 1)
-        pts = sorted({point(f)[:2] for f in glob.glob(prefix + "_m*.bin")})
-        ref = point(glob.glob(prefix + "_m*.bin")[0])[2]
-        xs = [100] + [x for x, _ in pts]
-        ys = [ref] + [y for _, y in pts]
-        ax.plot(xs, ys, "-", color=col, lw=1.2, alpha=0.8, label=f"{label} (stock {ref:.2f} ms)")
-        ax.plot([100], [ref], "x", color=col, ms=8)
+        files = glob.glob(prefix + "_m*.bin")
+        pts = [point(f) for f in files]
+        ref = pts[0][2]
+        if scale is None:                       # added heat relative to the first hover's Balanced choice
+            scale = point(f"{prefix}_p1.bin")[3]
+        fr = front([(max(h, 0.0) / scale, d) for _, d, _, h in pts] + [(0.0, ref)])
+        xs, ys = zip(*fr)
+        ax.plot(xs, ys, "-", color=col, lw=1.6, alpha=0.9, label=f"{label} (stock {ref:.2f} ms)")
         for k, (name, m) in enumerate(marks):
-            noise, delay, _, mult = point(f"{prefix}_p{k}.bin")
-            ax.plot([noise], [delay], m, color=col, ms=9, mec="white")
+            mult, delay, _, heat = point(f"{prefix}_p{k}.bin")
+            ax.plot([max(heat, 0.0) / scale], [delay], m, color=col, ms=9, mec="white", zorder=3)
             if col == colours[0]:
-                ax.annotate(f"{name} (D x{mult:.1f})", (noise, delay), textcoords="offset points", xytext=(8, 6), fontsize=9)
-    ax.set_xlabel("motor noise index vs the stock filters (%)")
+                ax.annotate(f"{name} (D x{mult:.1f})", (max(heat, 0.0) / scale, delay), textcoords="offset points",
+                            xytext=(8, 6), fontsize=9)
+    ax.set_xlabel("added motor heating from the ripple, relative (Balanced of hover 1 = 1)")
     ax.set_ylabel("P+D delay at the measured crossover (ms)")
-    ax.set_title("D-term search: the least delay for each noise, three hovers; x = stock filters", fontsize=10)
+    ax.set_title("D-term search: the least delay for each added heat, three hovers", fontsize=10)
     ax.grid(alpha=0.2)
     ax.legend(fontsize=9)
     fig.savefig(out, dpi=110, bbox_inches="tight")
