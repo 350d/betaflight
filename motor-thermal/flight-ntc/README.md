@@ -41,15 +41,18 @@ logged rpm, motor commands, battery voltage and current:
 
 | motor 2 | thermistor | estimator | estimator / thermistor rise |
 |---|---|---|---|
-| hover before the punches (80–100 s), rise | 8.4 K | 6.7 K | 0.80 |
-| end of the punches (140–150 s), rise | 12.9 K | 11.5 K | 0.89 |
-| hover after the punches (200–215 s), rise | 8.6 K | 7.1 K | 0.82 |
-| peak | 37.7 °C | 38.4 °C | |
-| whole flight (1 s average) | | RMSE 1.6 K, bias −1.2 K, max 3.2 K | |
-| the same estimator without the prop wash term | | RMSE 38.5 K (peak 95 °C) | |
+| hover before the punches (80–100 s), rise | 8.4 K | 7.9 K | 0.93 |
+| end of the punches (140–150 s), rise | 12.9 K | 13.2 K | 1.03 |
+| hover after the punches (200–215 s), rise | 8.6 K | 9.1 K | 1.05 |
+| peak | 37.6 °C | 39.9 °C | |
+| whole flight (1 s average) | | RMSE 0.8 K, bias +0.05 K, max 3.5 K | |
+| through the thermistor's ~5 s lag | | RMSE 0.54 K, bias −0.16 K, max 1.0 K | |
+| without the prop wash term | | RMSE 38.5 K (peak 95 °C) | |
 
-The estimator reads 10–20 % low on the rise in this flight. The thermistor lags by a few seconds (glued bead): through a
-5 s first-order lag the estimator gives RMSE 1.4 K, bias −1.3 K, so the lag explains the punch peaks, not the offset.
+Firmware f7361ccd9 (prop wash on the windings only). The first replay added the wash to the core as well, which counted
+the prop's induced flow twice: RMSE 1.6 K and a rise 10–20 % low. Open: after the punches the thermistor cools with a
+20 s time constant, the estimator with 7 s; the glued bead and the end turns are slower than the lumped winding node.
+
 No constant was changed for this comparison.
 
 ## Limits
