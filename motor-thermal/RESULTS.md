@@ -295,6 +295,15 @@ Committed as fdb4018d3 on #15848 and merged into #15851.
 
 ![three motors](pr-assets/scaling_three_motors_model_vs_camera.png)
 
+# Session 6, 2026-10-22: 1540 motors, resistance size law, database reduced to KV / stator / magnets
+
+Full write-up: [DATASHEET_VALIDATION.md](DATASHEET_VALIDATION.md), section "Winding resistance". In short: the resistance
+size law refitted on 769 FPV datasheets (R ∝ 1/(KV²·H^1.29·D^3.95), level at the 2203.5 reference) matches 81 published
+BrotherHobby winding temperatures (rise ratio 0.95) where their own R overshoots (1.43) with the same spread; brands quote R
+0.9-1.7x the trend. The datasheet R is no longer an input in the Configurator or MSP (CLI only, for a 4-wire measurement);
+the motor database keeps KV, stator size and magnets. All 285 full-throttle points: ratio 0.92 (IQR 0.61-1.38), median
+error 18 °C (28 °C with the previous law). The prop wash term is confirmed on the new points without a refit.
+
 # Session 5, 2026-10-21: datasheet validation, prop wash, datasheet resistance
 
 Full write-up: [DATASHEET_VALIDATION.md](DATASHEET_VALIDATION.md). In short: 220 published full-throttle temperatures of

@@ -2,7 +2,7 @@
 import json, re, numpy as np
 def prop_inch(s):
     if not s: return None
-    t = s.replace("×", "x").replace("*", "x")
+    t = s.replace("×", "x").replace("*", "x").replace("X", "x")
     m = re.search(r"(\d+(?:\.\d+)?)\s*mm", t, re.I)
     if m: return float(m.group(1)) / 25.4
     m = re.search(r"(\d+(?:\.\d+)?)\s*x\s*\d", t)
@@ -45,10 +45,11 @@ def points(path):
                     if rows:
                         row = min(rows, key=lambda r: abs(r["throttle_pct"] - thr))
             if not row or abs(row["throttle_pct"] - thr) > 5: continue
-            out.append(dict(name="%s %s %sKV %s %sV" % (rec["brand"], rec["model"], kv, tp.get("prop"), v), brand=rec["brand"],
+            steps = sorted([(r["throttle_pct"] / 100.0, float(r["current_a"]), r.get("rpm")) for r in rows if r["throttle_pct"] < row["throttle_pct"]]) if row else []
+            out.append(dict(steps=steps, name="%s %s %sKV %s %sV" % (rec["brand"], rec["model"], kv, tp.get("prop"), v), brand=rec["brand"],
                             d=float(d), h=float(h), kv=float(kv), poles=rec.get("magnets") or 14, r_mohm=rec.get("internal_resistance_mohm") or 0,
                             prop=prop, v=float(v), a=float(row["current_a"]), rpm=row.get("rpm"), thr=thr / 100.0, dur=duration_s(tp.get("duration")),
-                            amb=tp.get("ambient_c"), T=float(tp["value_c"]), kind=target_kind(rec, tp), notes=rec.get("notes") or ""))
+                            amb=tp.get("ambient_c"), T=float(tp["value_c"]), i0_a=rec.get("idle_current_a"), i0_v=rec.get("idle_current_voltage_v"), kind=target_kind(rec, tp), notes=rec.get("notes") or ""))
     return out
 if __name__ == "__main__":
     import sys, collections

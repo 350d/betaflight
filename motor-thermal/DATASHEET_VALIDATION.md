@@ -1,7 +1,9 @@
-# Motor thermal estimator: datasheet validation and high-load calibration (2026-10-21)
+# Motor thermal estimator: datasheet validation and high-load calibration (2026-10-21, updated 2026-10-22)
 
-Firmware: betaflight/betaflight#15848, commit "Motor thermal: prop wash cooling, climb and descent airflow".
-Data: [datasheets/motor_datasheets.json](datasheets/motor_datasheets.json) (169 motors, 146 with a published temperature, with source URLs).
+Firmware: betaflight/betaflight#15848, commits "Motor thermal: prop wash cooling, climb and descent airflow" and
+"Motor thermal: resistance size law refitted on 772 motor datasheets".
+Data: [datasheets/motor_datasheets.json](datasheets/motor_datasheets.json) (1540 motors of 58 brands, with source URLs;
+969+ with a published resistance, 950+ with an idle current, 285 usable full-throttle temperature points).
 Scripts: [datasheet_check/](datasheet_check/) (Python replica of `flight/motor_thermal.c`; it matches a host build of the firmware file within 0.3 °C on the bench sets).
 
 ## Why
@@ -12,15 +14,38 @@ full throttle, 43-62 °C published) came out at 185-255 °C in the model. A coll
 220 usable full-throttle points from 9 brands (stator 7-31 mm, 1S-6S): the model's temperature rise over ambient was
 **2.72x** the published one (median, IQR 1.25-4.50), up to 9x for some brands.
 
-## Winding resistance: from the datasheet
+## Winding resistance: a size law, not the datasheet value
 
-- The reference resistance was a multimeter reading (0.4 Ω minus 0.2 Ω leads, ±0.1). The X-NOVA 2203.5 2800KV datasheet
-  gives **0.070 Ω**; 2400KV 0.105 and 1800KV 0.19 Ω follow R ∝ 1/KV² within 10 %.
-- With 0.070 Ω the bench runs of the reference motor fit better (RMSE 0.96-1.38 °C instead of 1.34-1.45, bias ~0) and
-  the derived R of a 2207 1950KV is 0.072 Ω, in line with common datasheets.
-- The size law underestimates R of small motors 1.6-2.1x (GEPRC 1408 98 mΩ, XING 1204 4500KV 172 mΩ, 6500KV 108 mΩ):
-  `motor_resistance` (Configurator: Advanced motor settings) takes the datasheet "internal resistance". A multimeter
-  reads too high on 5" and larger motors (lead resistance is comparable to the winding).
+First pass (169 motors): the old size law R ∝ 1/(KV²·H·D^2.5) read small motors' R 1.6-2.1x low, so the datasheet
+"internal resistance" became an input. The extended data set changed that conclusion.
+
+- **The size law, refitted** on 769 FPV-size datasheets (stator 8-32 mm): the exponents of R ∝ 1/(KV²·H^1.29·D^3.95)
+  are the same on the first 126 motors and on all 769. The previous law was off by 2.84x on stators of 14 mm and smaller
+  and 0.74x above 25 mm (median error x1.40, 90 % within x3.4).
+- **The level stays at the reference** (X-NOVA 2203.5 2800KV, 70 mΩ). Published resistances sit at 0.9-1.7x of it
+  depending on the brand (BrotherHobby 1.36, DarwinFPV 1.74, T-Motor 1.19, iFlight 1.25, RCinPower 1.06, SunnySky 0.89):
+  median x1.24 against the law, x1.17 against a free fit.
+- **Which level is right**: 81 BrotherHobby runs publish the copper (winding) temperature with the load row (60 of them
+  re-read from the report images). With the law the model's rise is **0.95x** the published one (IQR 0.76-1.25); with
+  BrotherHobby's own R it is **1.43x** (IQR 1.16-1.88), with the same spread after centring (x1.25 vs x1.28). Their R
+  carries their measuring convention (leads, meter), not extra information about the motor.
+- **What the published temperatures are.** Of 1540 motors, 209 publish a temperature; the usable full-throttle points
+  (with the load row) split by method:
+
+  | method | brand | points | model / published rise (size law) |
+  |---|---|---|---|
+  | "copper wire temperature", the windings, mostly 1-2 min, ambient given | BrotherHobby | 81 | **0.95** (IQR 0.76-1.25), median error 15 °C |
+  | case surface after 1 min | T-Motor | 68 | 0.51 (IQR 0.35-0.86) against the model's core node |
+  | not stated (GEPRC, iFlight, VCI, RCinPower*, Axisflying, AMAX, Flywoo) | | 136 | 1.08 (IQR 0.68-1.63); lower bounds only |
+
+  *RCinPower's "winding" label comes from the collector's notes, not from the datasheet, so it is not counted as stated.
+  Only the BrotherHobby points are used to judge the level; the unstated ones are never fitted.
+- **Prop wash on the same points**: without the wash term the ratio is 3.25 (IQR 2.38-4.45), with it 0.95; the term was set
+  before these points were collected.
+- **Consequence**: the firmware keeps `motor_resistance` as a CLI setting for a 4-wire measurement (0 = the law), out of
+  MSP; the Configurator's motor database fills in only KV, stator size and magnets. The bench runs (low throttle) do not
+  move: the load copper loss is negligible there.
+- The ripple-loss scale (noise term) keeps its bench fit; it is not tied to the resistance law.
 
 ## Idle current: tried and dropped
 
@@ -29,6 +54,10 @@ the model's no-load term is an effective quantity fitted on the bench (2.5-5x th
 Datasheets also quote it at different voltages (10 V or 5.5 V). No input for it.
 
 ## Prop wash: the missing cooling
+
+*First pass (21 October), on the 220 points of the first 169 motors with all measuring methods mixed. The check on
+winding temperatures only (81 BrotherHobby points, collected later) is in the method table above: 3.25 without the term,
+0.95 with it.*
 
 The wash speed over the motor, v = n·D·0.252 (the induced velocity the model already used), adds forced convection on the
 windings and the stator core, Newton cooling with the turbulent Nusselt exponent:
@@ -81,16 +110,21 @@ race 2.5 min (70 % average, 25 m/s), full-throttle climb 20 s at 18 m/s then des
 
 | motor | hover | cruise 15 m/s (GPS) | freestyle (punch 3 s / 20 s) | race (70 % avg, 25 m/s) | full-throttle climb 20 s, then descend |
 |---|---|---|---|---|---|
-| 1204 4500KV 3S 2.5" (XING, R 172 mOhm) | +17 K | +19 K | +50 K | +50 K | +56 K |
-| 1408 3500KV 4S 3" (GEPRC, R 98 mOhm) | +13 K | +15 K | +38 K | +39 K | +44 K |
-| 2203.5 2800KV 4S 4" (X-NOVA, R 70 mOhm) | +9 K | +10 K | +38 K | +43 K | +47 K |
-| 2207 1950KV 6S 5" (R auto) | +11 K | +11 K | +59 K | +66 K | +73 K |
-| 2806.5 1300KV 6S 7" (R auto) | +18 K | +20 K | +76 K | +91 K | +101 K |
+| 1204 4500KV 3S 2.5" (XING) | +20 K | +22 K | +67 K | +67 K | +75 K |
+| 1408 3500KV 4S 3" (GEPRC) | +13 K | +14 K | +36 K | +37 K | +42 K |
+| 2203.5 2800KV 4S 4" (X-NOVA) | +9 K | +10 K | +38 K | +43 K | +47 K |
+| 2207 1950KV 6S 5" | +9 K | +10 K | +49 K | +54 K | +60 K |
+| 2806.5 1300KV 6S 7" | +11 K | +12 K | +45 K | +54 K | +60 K |
+
+All five with `motor_resistance` 0 (the size law), as a Configurator user gets them.
 
 ## Limits
 
-- Full throttle: unbiased over 220 points, but one point can be off by 2x (IQR 0.64-1.57); brands that measure the copper
-  or report no duration sit 1.4-2x above, T-Motor's 1-min surface 0.54x below.
+- Full throttle: checked on the one brand that states a winding temperature (81 points, ratio 0.95, IQR 0.76-1.25).
+  T-Motor's 1-min case surface is 2x the model's core rise while the windings fit: open (the case may read close to the
+  windings, or the core-to-air path is too strong at full throttle). One point can still be off by 1.3x.
+- Prop wash: refitting its speed and exponent on the 81 BrotherHobby winding points gives nothing out of sample (5-fold
+  by motor, RMS log error 0.434 -> 0.434); the fitted speed is 1.05 m/s against the firmware's 1.0.
 - Partial throttle with a prop has no ground truth yet: the datasheets give the temperature only at full throttle, the
   bench had no prop. The exponent comes from physics and the wash-speed check above, not from hover data.
 - The no-load term is the bench-fitted effective one (above the physical no-load power).
@@ -101,3 +135,6 @@ race 2.5 min (70 % average, 25 m/s), full-throttle climb 20 s at 18 m/s then des
 
     python3 datasheet_check/dsdoc.py datasheets/motor_datasheets.json     # tables above
     python3 datasheet_check/dsplot.py datasheets/motor_datasheets.json out.png
+    python3 datasheet_check/rlaw_fit.py datasheets/motor_datasheets.json   # resistance and no-load size laws
+    python3 datasheet_check/rvalue.py datasheets/motor_datasheets.json     # law vs datasheet R by measuring method
+    python3 datasheet_check/washcv.py datasheets/motor_datasheets.json     # prop wash refit, cross-validated
