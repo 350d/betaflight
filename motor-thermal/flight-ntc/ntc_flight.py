@@ -3,7 +3,7 @@ import math, sys
 import numpy as np
 from orangebox import Parser
 
-B, RPULL, R25 = 3950.0, 3300.0, 10000.0
+B, RPULL, R25 = 3380.0, 3300.0, 10000.0
 path, out = sys.argv[1], sys.argv[2]
 p = Parser.load(path)
 names = p.field_names

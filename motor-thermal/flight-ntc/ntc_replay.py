@@ -25,7 +25,7 @@ a, t, idx = a[::step], t[::step], idx[::step]
 vbat, amps = a[:, 1] * 0.01, a[:, 2] * 0.01 * float(os.environ.get("AMPS_K", "1"))
 cmd = np.clip((a[:, 4:8] - 48) / 1999, 0, 1); rpm = a[:, 8:12] * 100 / (POLES / 2)
 v = np.clip(a[:, 3], 1, 1022); r = 3300 * v / (1023 - v)
-ntc = 1 / (1 / 298.15 + np.log(r / 10000) / 3950) - 273.15
+ntc = 1 / (1 / 298.15 + np.log(r / 10000) / float(os.environ.get("NTC_B", "3950"))) - 273.15
 onboard = a[:, 12:16] / 10
 def run(ev, tamb, t0, extra_env=None):
     path = os.path.join(OUT, "ntc_fl4.csv")

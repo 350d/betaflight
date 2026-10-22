@@ -299,7 +299,8 @@ Committed as fdb4018d3 on #15848 and merged into #15851.
 
 [flight-ntc/README.md](flight-ntc/README.md): 5" 2203.5, NTC on motor 2's end turns, hover and throttle punches. The
 current firmware estimator, replayed on the logged data with the board's current scale and the thermistor's ambient,
-follows the thermistor with RMSE 0.88 K (bias +0.08 K, max 3.7 K) over 216 s; without the prop wash term it is 39.8 K off.
+follows the thermistor (NTC 10k, B 3380) with RMSE 1.6 K over 216 s and reads 10–20 % low on the rise (hover 6.7–7.1 K
+against 8.4–8.6 K); without the prop wash term it is 38.5 K off.
 One flight on the reference motor size; the size scaling still needs a flight on another motor.
 
 # Session 6, 2026-10-22: 1540 motors, resistance size law, database reduced to KV / stator / magnets
