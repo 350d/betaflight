@@ -44,10 +44,8 @@
 
 #include "motor_thermal.h"
 
-// Bench reference: X-NOVA 2203.5 2800KV, no prop, two-node fit on random + flight-like regimes
-// (research/motor-thermal, RMSE ~1 °C). The fitted model is scaled as a whole (P·s, C·s, R/s) so that
-// the ripple copper loss equals the measured excess bus power (2.0 W at 35 rms command noise, 16.2 V). Units: J/K, K/W, W/krpm², W/(rpm·duty)², Ohm, m/s.
-// Size and magnet scaling checked on GEPRC 1408 3500KV and XING 1204 4500KV (12 magnets): RMSE 1.1-1.2 °C, the reference fit unchanged.
+// Bench reference: X-NOVA 2203.5 2800KV, no prop, two-node fit (research/motor-thermal, RMSE ~1 °C), scaled so the
+// ripple copper loss equals the measured excess bus power. Size/magnet scaling checked on 1408 and 1204 motors.
 #define REF_D_MM        22.0f
 #define REF_H_MM        3.5f
 #define REF_KV          2800.0f
@@ -62,11 +60,8 @@
 #define REF_R_LL        0.070f     // line-to-line winding resistance, datasheet (load-current copper loss)
 #define AIR_GAIN        1.56f   // convection: 1 + AIR_GAIN·(v/10 m/s)^1.5
 #define PROP_VI_K       0.252f     // induced velocity = n[rev/s]·D[m]·sqrt(2·Ct/π), Ct≈0.1
-// Prop wash over the motor: forced convection on the windings (end turns in the wash), Newton cooling with the
-// turbulent h ∝ v^0.8. The core already sees the prop's induced flow through airFactor(), so the wash is not added
-// there again. The bench motor had no prop, so the bench fit is unchanged. Checked on 81 published BrotherHobby
-// winding temperatures at full throttle (research/motor-thermal/DATASHEET_VALIDATION.md): model/datasheet rise
-// median 0.99, IQR 0.77-1.33 (3.25 without this term), and on a 5" flight against a thermistor on a winding.
+// Prop wash on the windings' end turns, turbulent h ∝ v^0.8 (the core gets the induced flow via airFactor()).
+// Checked on 81 published winding temperatures (rise ratio median 0.99) and a 5" flight with a winding thermistor.
 #define WASH_REF_MS     1.0f       // wash speed at which the extra cooling equals the still-air core cooling
 #define WASH_N          0.8f
 #define WASH_MAX        100.0f     // keeps the 10 ms explicit step stable on the smallest motors
@@ -111,9 +106,8 @@ static void ambientConsider(int t, int *best)
 }
 
 #ifdef USE_DSHOT_TELEMETRY
-// Bidirectional DShot ESCs report only eRPM until asked for the extended telemetry (temperature, ...), which the
-// core asks for at arming. A cold ESC is the best ambient reference, so with dshot_edt on ask while disarmed:
-// only with every motor stopped (no disarmed motor test or excitation running) and nothing else in the queue.
+// The core asks for extended telemetry only at arming; a cold ESC is the best ambient reference, so with dshot_edt
+// on ask while disarmed, with every motor stopped and the command queue empty.
 static void edtRequest(void)
 {
     if (!motorConfig()->dev.useDshotEdt || rt.edtTries >= EDT_TRIES || !isDshotTelemetryActive() || !dshotCommandQueueEmpty()) {
@@ -156,12 +150,8 @@ static int escTemperature(int motor)
     return 0;
 }
 
-// The ambient before the first arm: the lowest plausible reading of the ESCs (DShot extended telemetry or ESC sensor;
-// a cold ESC was within ~1 °C of a thermistor on a 5") and of the FC board's sensors (gyro, baro, MCU). Each source
-// keeps its lowest reading since power-up: the board warms up afterwards (+9 °C over the air after an hour on USB),
-// so its first readings are the closest to the air. Looked at once a second while disarmed, so a source that comes
-// later (ESC telemetry once the battery is in) still counts; frozen at the first arm. Without any, the default stays.
-// The temperature sources are also sampled after the arm, once a second, for the debug log.
+// Ambient before the first arm: the lowest plausible ESC or FC-board (gyro, baro, MCU) reading since power-up
+// (the board warms up later), checked once a second while disarmed, frozen at the first arm. Also feeds the debug log.
 static void ambientUpdate(void)
 {
     if (++rt.ambientCounter < UPDATE_HZ) {
@@ -232,9 +222,8 @@ static float airFactor(float airSpeedSq)
     return 1.0f + AIR_GAIN * v * sqrtf(v);
 }
 
-// Cooling to the air at this rpm, as multiples of the still-air conductance 1/rca: the core through the airflow over
-// the stator (bell, prop induced flow, craft speed), the windings through the prop wash over the end turns. Shared by
-// the time step and the steady-state ripple rise, so the two cannot drift apart.
+// Cooling to the air as multiples of 1/rca: the core by the air over the stator (bell, prop induced flow, craft
+// speed), the windings by the prop wash. Shared by the time step and the steady ripple rise.
 static float coreCooling(float rpm, float vCraftSq)
 {
     return airFactor(sq(rpm) * rt.airK + vCraftSq);
@@ -276,8 +265,7 @@ void motorThermalInit(void)
     rt.airK = (sq(2.0f * M_PIf * bellRadiusM) + sq(propDiameterM * PROP_VI_K)) / sq(60.0f);  // bell surface and prop induced speed
     rt.washK = propDiameterM * PROP_VI_K / 60.0f;
 
-    // Parameters are recomputed on every (disarmed) profile change, the thermal state only once at boot:
-    // a hot motor must not read as ambient after a profile switch on the ground.
+    // the thermal state is set once at boot: a hot motor must not read as ambient after a profile switch
     static bool stateInitialised = false;
     if (!stateInitialised) {
         rt.tAmb = AMBIENT_DEFAULT_C;
@@ -294,8 +282,7 @@ void motorThermalInit(void)
     }
 }
 
-// Scheduler task at UPDATE_HZ, fed with the mixer's final motor outputs, so that every output path (normal
-// mix, motor stop, crash flip) is covered. The model integrates over the real interval: a late run stays right.
+// Scheduler task at UPDATE_HZ on the mixer's final outputs (every output path), integrated over the real interval.
 void motorThermalUpdate(timeUs_t currentTimeUs)
 {
     const float dt = rt.lastUs ? constrainf(cmpTimeUs(currentTimeUs, rt.lastUs) * 1e-6f, 0.0f, 0.1f) : 1.0f / UPDATE_HZ;
@@ -309,18 +296,15 @@ void motorThermalUpdate(timeUs_t currentTimeUs)
     ambientUpdate();
 
     const float vbat = getBatteryVoltage() * 0.01f;
-    const float unloadedMaxRpm = vbat * rt.kv;
-    // same load derating as motorEstimateMaxRpm(); it turns negative past KV·Vbat ≈ 173k (e.g. 21000 KV on 2S)
-    const float maxRpm = MAX(unloadedMaxRpm * (-5.44e-6f * unloadedMaxRpm + 0.944f), 0.0f);
+    const float maxRpm = MAX(motorEstimateMaxRpm(), 0.0f);          // its load derating turns negative past KV·Vbat ≈ 173k
     const float kCu = rt.kCu * sq(vbat);
 #ifdef USE_DSHOT_TELEMETRY
     const bool haveRpm = isDshotTelemetryActive();
 #endif
-    // Battery current split across motors when per-motor ESC current is not available. With rpm telemetry each
-    // motor gets the current its prop takes, propK·rpm³/Vbat, with propK learnt in normal flight; what the props do
-    // not explain goes to the motors held back below their rpm for the command (stalled in a crash, a blocked prop),
-    // which take current without turning it into thrust. Before propK is learnt: by rpm³. Without telemetry: by
-    // command². The command alone gives a stalled motor the largest share whether it takes current or not.
+    // Battery current split when there is no per-motor ESC current. With rpm telemetry each motor gets its prop's
+    // current, propK·rpm³/Vbat (propK learnt while every motor turns as commanded; until then the rpm³ share), and
+    // what the props do not explain goes to the motors held below half their no-load rpm (a stall that still takes
+    // current). Without telemetry: by command², which would give a stalled motor the largest share.
     float cmdSqSum = 0.0f, rpmCubeSum = 0.0f, heldSum = 0.0f;
     float cmdFrac[MAX_SUPPORTED_MOTORS], rpmOf[MAX_SUPPORTED_MOTORS], held[MAX_SUPPORTED_MOTORS];
     for (int i = 0; i < motorCount && i < MAX_SUPPORTED_MOTORS; i++) {
@@ -353,11 +337,10 @@ void motorThermalUpdate(timeUs_t currentTimeUs)
         const float sample = motorsAmps * vbat / rpmCubeSum;
         rt.propK = rt.propK > 0.0f ? rt.propK + (sample - rt.propK) * MIN(1.0f, dt / PROP_K_TAU_S) : sample;
     }
-    float propAmpsSum = 0.0f;
-    if (splitByRpm && rt.propK > 0.0f) {
-        propAmpsSum = rt.propK * rpmCubeSum / MAX(vbat, 1.0f);
-    }
-    const float heldAmps = MAX(motorsAmps - propAmpsSum, 0.0f);     // current the props do not explain
+    // prop current per krpm³: all of the current, capped by the learnt propK while a motor is held back
+    const float allPerCube = splitByRpm ? motorsAmps / rpmCubeSum : 0.0f;
+    const float propPerCube = heldSum > 0.0f && rt.propK > 0.0f ? MIN(rt.propK / MAX(vbat, 1.0f), allPerCube) : allPerCube;
+    const float heldAmps = MAX(motorsAmps - propPerCube * rpmCubeSum, 0.0f);   // current the props do not explain
     float vCraftSq = 0.0f;
 #ifdef USE_GPS
     if (STATE(GPS_FIX)) {
@@ -371,7 +354,7 @@ void motorThermalUpdate(timeUs_t currentTimeUs)
         const float rpm = rpmOf[i];
         const float air = coreCooling(rpm, vCraftSq);
         const float wash = windingCooling(rpm);
-        const float pCu = kCu * motorNoiseMsq(i, 0);
+        const float pCu = kCu * motorNoiseMsq(i);
         const float pIron = rt.aIron * sq(rpm);
         // torque current copper loss: phase current ≈ bus current / duty, ripple energy (already in pCu) removed
         float motorAmps = 0.0f;
@@ -380,15 +363,8 @@ void motorThermalUpdate(timeUs_t currentTimeUs)
             motorAmps = dshotTelemetryState.motorState[i].telemetryData[DSHOT_TELEMETRY_TYPE_CURRENT];
         } else
 #endif
-        if (propAmpsSum > 0.0f) {
-            const float propAmps = rt.propK * power3(rpm * 0.001f) / MAX(vbat, 1.0f);
-            if (heldSum > 0.0f) {
-                motorAmps = MIN(propAmps, motorsAmps * propAmps / propAmpsSum) + heldAmps * held[i] / heldSum;
-            } else {
-                motorAmps = motorsAmps * propAmps / propAmpsSum;    // nothing held back: all of it is prop load
-            }
-        } else if (splitByRpm) {
-            motorAmps = motorsAmps * power3(rpm * 0.001f) / rpmCubeSum;
+        if (splitByRpm) {
+            motorAmps = propPerCube * power3(rpm * 0.001f) + (heldSum > 0.0f ? heldAmps * held[i] / heldSum : 0.0f);
         } else if (cmdSqSum > 0.0f) {
             motorAmps = motorsAmps * sq(cmdFrac[i]) / cmdSqSum;
         }

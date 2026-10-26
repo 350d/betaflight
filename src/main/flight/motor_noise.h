@@ -23,9 +23,7 @@
 
 #include <stdint.h>
 
-#define MOTOR_NOISE_BANDS 2   // band 0: > MOTOR_NOISE_HP0_HZ, band 1: > MOTOR_NOISE_HP1_HZ
-
 void motorNoiseInit(float looptimeUs);
 void motorNoiseUpdate(const float *motorOutput, int motorCount);
-float motorNoiseRms(int motor, int band);   // external (1000..2000) command units
-float motorNoiseMsq(int motor, int band);   // mean square of the above, no sqrtf
+float motorNoiseRms(int motor);   // command noise above 80 Hz, external (1000..2000) command units
+float motorNoiseMsq(int motor);   // its mean square
