@@ -25,5 +25,5 @@
 
 void motorNoiseInit(float looptimeUs);
 void motorNoiseUpdate(const float *motorOutput, int motorCount);
-float motorNoiseRms(int motor);   // command noise above 80 Hz, external (1000..2000) command units
+float motorNoiseRms(int motor);   // command ripple in the 20 Hz..2 kHz band, external (1000..2000) command units
 float motorNoiseMsq(int motor);   // its mean square

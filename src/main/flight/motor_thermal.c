@@ -56,7 +56,7 @@
 #define REF_RSC         3.63f   // windings -> core, K/W
 #define REF_RCA         11.3f   // core -> air, still air, K/W
 #define REF_A_IRON      0.0449f   // iron loss per (rpm/1000)², W
-#define REF_K_CU        7.94e-07f   // ripple copper loss per (KV·Vbat·duty_rms)², W
+#define REF_K_CU        2.60e-07f   // ripple copper loss per (KV·Vbat·duty_rms)², W (duty in the motor_noise band, level from flights)
 #define REF_R_LL        0.070f     // line-to-line winding resistance, datasheet (load-current copper loss)
 #define AIR_GAIN        1.56f   // convection: 1 + AIR_GAIN·(v/10 m/s)^1.5
 #define PROP_VI_K       0.252f     // induced velocity = n[rev/s]·D[m]·sqrt(2·Ct/π), Ct≈0.1

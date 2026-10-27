@@ -30,23 +30,29 @@
 
 #include "motor_noise.h"
 
-#define MOTOR_NOISE_HP_HZ    80.0f    // below this the prop still follows the command: not ripple
+// Band of the command that heats the windings as ripple current. A constant-amplitude sweep on a 2203.5 with a 5"
+// prop (research/motor-thermal/RESULTS.md, 2026-10-27) is flat from ~20 to ~400 Hz and 0.52 at 1 kHz (winding
+// inductance, command update rate). The prop follows the command below that: 0.73 at 11 Hz. The 20 Hz edge and the
+// loss level (REF_K_CU) are set on three flights with a thermistor on a winding, which a wider band made worse.
+#define MOTOR_NOISE_LOW_HZ    20.0f
+#define MOTOR_NOISE_HIGH_HZ   2000.0f
 #define MOTOR_NOISE_AVG_S     0.5f    // averaging time constant
 
-static pt1Filter_t lowpass[MAX_SUPPORTED_MOTORS];   // highpass = input - lowpass
-static float meanSq[MAX_SUPPORTED_MOTORS];         // EMA of the squared highpassed command
-static bool seeded;                                 // the lowpass starts at the first sample: no start-up transient
-static float kAvg;
+static float fast[MAX_SUPPORTED_MOTORS], slow[MAX_SUPPORTED_MOTORS];   // band = fast - slow, two PT1 lowpasses
+static float meanSq[MAX_SUPPORTED_MOTORS];         // EMA of the squared band
+static bool seeded;                                 // the lowpasses start at the first sample: no start-up transient
+static float kFast, kSlow, kAvg;
 static float scaleToExternal;
 
 void motorNoiseInit(float looptimeUs)
 {
     const float dt = looptimeUs * 1e-6f;
     for (int i = 0; i < MAX_SUPPORTED_MOTORS; i++) {
-        pt1FilterInit(&lowpass[i], pt1FilterGain(MOTOR_NOISE_HP_HZ, dt));
         meanSq[i] = 0.0f;
     }
     seeded = false;
+    kFast = pt1FilterGain(MOTOR_NOISE_HIGH_HZ, dt);
+    kSlow = pt1FilterGain(MOTOR_NOISE_LOW_HZ, dt);
     kAvg = dt / MOTOR_NOISE_AVG_S;
     // internal motor units -> external 1000..2000 units, measured in the linear region
     scaleToExternal = 200.0f / (motorConvertFromExternal(1600) - motorConvertFromExternal(1400));
@@ -58,10 +64,12 @@ NOINLINE void motorNoiseUpdate(const float *motorOutput, int motorCount)
     for (int i = 0; i < motorCount && i < MAX_SUPPORTED_MOTORS; i++) {
         const float x = motorOutput[i] * scaleToExternal;
         if (!seeded) {
-            lowpass[i].state = x;
+            fast[i] = slow[i] = x;
         }
-        const float hp = x - pt1FilterApply(&lowpass[i], x);
-        meanSq[i] += kAvg * (hp * hp - meanSq[i]);
+        fast[i] += kFast * (x - fast[i]);
+        slow[i] += kSlow * (fast[i] - slow[i]);
+        const float band = fast[i] - slow[i];
+        meanSq[i] += kAvg * (band * band - meanSq[i]);
     }
     seeded = true;
     if (debugMode == DEBUG_MOTOR_NOISE) {
