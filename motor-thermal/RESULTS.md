@@ -320,3 +320,60 @@ Full write-up: [DATASHEET_VALIDATION.md](DATASHEET_VALIDATION.md). In short: 220
 prop). Forced convection with the turbulent h ∝ v^0.8 brings the median to 0.99 (IQR 0.64-1.57) and leaves the bench
 fit unchanged. The reference winding resistance is now the datasheet 0.070 Ω (the 0.2 Ω above was a multimeter
 reading); the datasheet idle current was tried as an input and dropped.
+
+# Session 2026-10-27: frequency sweep at constant amplitude (question from ctzsnooze)
+
+5" HAKRCF722V2, motor 4 bare (no prop), BLHeli_32, DShot300 bidir, PID 4 kHz; motor 3 (prop) at 1060 for steady airflow,
+motors 1-2 stopped. Base 1150, sine ±50 (35.3 rms) for 120 s, then 120 s base at the same command; camera ROI on the
+windings (88,58,68,42). T_inf by a single-exponential fit per segment, excess over the mean of the neighbouring bases,
+normalised to 15.5 V (ΔV ∝ Vbat). Heat ∝ ΔT^1.25 (convection, session 3). Bench script run_sweep.sh (excite.py loop), logs kept locally.
+
+| Hz | 23 | 47 | 101 | 151 | 201 | 201 (repeat) | 401 | 601 | 801 | 1001 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ΔT K | 5.13 | 6.58 | 7.29 | 7.07 | 7.42 | 7.16 | 6.97 | 6.44 | 5.93 | 5.42 |
+| heat rel. | 0.65 | 0.89 | 1.01 | 0.97 | 1.03 | 0.99 | 0.95 | 0.86 | 0.78 | 0.70 |
+| bus power rel. | 0.77 | 0.94 | 0.99 | 1.03 | 0.98 | 1.01 | 0.91 | 0.81 | 0.78 | 0.73 |
+| rpm swing ± | 829 | 460 | 261 | 187 | 167 | 258 | 130 | 128 | 223 | 105 |
+
+- Plateau 100-400 Hz, gentle roll-off above: 0.70 at 1 kHz (first-order corner ~1.5 kHz). Part of it is the 4 kHz
+  command update (zero-order hold: the 1 kHz fundamental keeps 0.81 of its power), the same in flight at this loop rate.
+- Session 2's "half at 400 Hz" is not reproduced (0.95 today): that point was likely a camera/ADC-aliasing artefact.
+- Low side (bare motor): 0.89 at 47 Hz, 0.65 at 23 Hz, rpm swing grows: the rotor starts to follow. Fits a first-order
+  high-pass near 15 Hz. With a prop the corner should move lower (more inertia) - not measured.
+- Firmware model today (80 Hz PT1 high-pass, mean square): 0.08 at 23 Hz, 0.26 at 47 Hz, 0.61 at 101 Hz, ~1 at 1 kHz.
+  It underestimates 20-100 Hz ripple heat (×8 at 23 Hz on a bare motor) and overestimates 1 kHz by ~1.4×.
+- Bus power and winding temperature agree within ±0.1: the ESC share of the ripple loss does not change much with frequency.
+- ESC temperature: BLHeli_32 did not report EDT temperature (0).
+
+## Same sweep with a 5" prop (2026-10-27, frame held down)
+
+Motor 4 with its prop, base 1200 (~7500 rpm, 1.4-1.7 A total), 90 s segments (tau 15-20 s with prop airflow),
+otherwise as above. Normalised to 15.0 V and corrected for a linear drift between the two 201 Hz runs
+(ΔT 4.55 → 4.25 K, bus excess 1.83 → 1.40 W).
+
+| Hz | 11 | 23 | 47 | 101 | 201 | 401 | 1001 |
+|---|---|---|---|---|---|---|---|
+| ΔT K (15 V) | 3.52 | 4.34 | 4.43 | 4.35 | 4.55/4.25 | 4.09 | 2.59 |
+| heat rel. | 0.73 | 0.99 | 0.99 | 1.02 | 1 | 0.93 | 0.52 |
+| bus power rel. | 0.69 | 0.93 | 1.06 | 1.03 | 1 | 0.93 | 0.49 |
+| rpm swing ± | 410 | 249 | 160 | 141 | 178/165 | 199 | 191 |
+
+- With the prop the plateau reaches down to ~20 Hz (bare: ~100 Hz) and 11 Hz still gives 0.73: the prop's inertia
+  moves the low corner to a few Hz, as expected. The firmware's 80 Hz high-pass gives 0.08 at 23 Hz.
+- High side drops faster than bare: 0.52 at 1 kHz (bare 0.70). Not explained yet (higher duty/current, ESC).
+- Absolute ripple heating is lower with the prop (ΔT ~4.4 vs ~7.3 K, bus excess ~1.8 vs ~2.9 W) at the same amplitude.
+
+## Model update from the sweep (2026-10-27, #15848 fcaa103b7, local)
+
+motor_noise band: PT1 2 kHz minus PT1 20 Hz (was 1 - PT1 80 Hz); REF_K_CU 7.94e-7 -> 2.60e-7. Replays (motor 2 vs NTC,
+5 s sensor lag; index from the logged command at log rate, host replay of the blackbox logs):
+
+| variant | hover 22.10 (Tamb 24.6 measured) | flight 23.10 log 2 | crash 23.10 log 4 |
+|---|---|---|---|
+| before (80 Hz HP, 7.94e-7) | 0.61 K | 1.35 K | 5.24 K |
+| 7 Hz-2 kHz, bench level x0.6 (bus power with prop) | 0.83 | 1.25 | 6.00 |
+| 20 Hz-2 kHz, 2.60e-7 (committed) | 0.57 | 0.97 | 5.03 |
+
+All three flights favour less ripple heat than the bench level; the 23.10 flights (air -12 °C, Tamb 12.2 assumed) carry
+a +0.5…+3 K bias from other terms, so the level is a fit, not a measurement. The 7 Hz edge that matches the prop sweep
+best made every flight worse.
